@@ -138,10 +138,20 @@ namespace Mono.CSharp
 
 			// Sets output file metadata version, this makes sense for mscorlib
 			// compilation only but won't restrict that for now
-			if (RootContext.StdLibRuntimeVersion == RuntimeVersion.v4) {
+			switch (RootContext.StdLibRuntimeVersion){
+			case RuntimeVersion.v4:
 				Builder.__SetImageRuntimeVersion ("v4.0.30319", 0x20000);
-			} else {
-				// otherwise we default to v2.0.50727
+				break;
+			case RuntimeVersion.v2:
+				Builder.__SetImageRuntimeVersion ("v2.0.50727", 0x20000);
+				break;
+			case RuntimeVersion.v1:
+				// Compiler does not do any checks whether the produced metadata
+				// are valid in the context of 1.0 stream version
+				Builder.__SetImageRuntimeVersion ("v1.1.4322", 0x10000);
+				break;
+			default:
+				throw new NotImplementedException ();
 			}
 
 			builder_extra = new AssemblyBuilderIKVM (Builder, Compiler);
@@ -357,13 +367,117 @@ namespace Mono.CSharp
 	//
 	class MissingAssembly : Assembly
 	{
+		class MissingModule : Module
+		{
+			readonly Assembly assembly;
+
+			public MissingModule (Universe universe, Assembly assembly)
+				: base (universe)
+			{
+				this.assembly = assembly;
+			}
+
+			public override int MDStreamVersion {
+				get {
+					throw new NotImplementedException ();
+				}
+			}
+
+			public override Assembly Assembly {
+				get {
+					return assembly;
+				}
+			}
+
+			public override string FullyQualifiedName {
+				get {
+					throw new NotImplementedException ();
+				}
+			}
+
+			public override string Name {
+				get {
+					throw new NotImplementedException ();
+				}
+			}
+
+			public override Guid ModuleVersionId {
+				get {
+					throw new NotImplementedException ();
+				}
+			}
+
+			public override MetaType ResolveType (int metadataToken, MetaType[] genericTypeArguments, MetaType[] genericMethodArguments)
+			{
+				throw new NotImplementedException ();
+			}
+
+			public override MethodBase ResolveMethod (int metadataToken, MetaType[] genericTypeArguments, MetaType[] genericMethodArguments)
+			{
+				throw new NotImplementedException ();
+			}
+
+			public override FieldInfo ResolveField (int metadataToken, MetaType[] genericTypeArguments, MetaType[] genericMethodArguments)
+			{
+				throw new NotImplementedException ();
+			}
+
+			public override MemberInfo ResolveMember (int metadataToken, MetaType[] genericTypeArguments, MetaType[] genericMethodArguments)
+			{
+				throw new NotImplementedException ();
+			}
+
+			public override string ResolveString (int metadataToken)
+			{
+				throw new NotImplementedException ();
+			}
+
+			public override MetaType[] __ResolveOptionalParameterTypes (int metadataToken)
+			{
+				throw new NotImplementedException ();
+			}
+
+			public override string ScopeName {
+				get {
+					throw new NotImplementedException ();
+				}
+			}
+
+			internal override MetaType GetTypeImpl (string typeName)
+			{
+				throw new NotImplementedException ();
+			}
+
+			internal override void GetTypesImpl (List<MetaType> list)
+			{
+				throw new NotImplementedException ();
+			}
+
+			public override AssemblyName[] __GetReferencedAssemblies ()
+			{
+				throw new NotImplementedException ();
+			}
+
+			internal override MetaType GetModuleType ()
+			{
+				throw new NotImplementedException ();
+			}
+
+			internal override IKVM.Reflection.Reader.ByteReader GetBlob (int blobIndex)
+			{
+				throw new NotImplementedException ();
+			}
+		}
+
 		readonly string full_name;
+		readonly Module module;
 		Dictionary<string, MetaType> types;
 
 		public MissingAssembly (Universe universe, string fullName)
 			: base (universe)
 		{
 			this.full_name = fullName;
+			this.module = new MissingModule (universe, this);
 			types = new Dictionary<string, MetaType> ();
 		}
 
@@ -391,7 +505,7 @@ namespace Mono.CSharp
 
 		public override Module ManifestModule {
 			get {
-				throw new NotImplementedException ();
+				return module;
 			}
 		}
 
@@ -451,7 +565,7 @@ namespace Mono.CSharp
 			//
 			MetaType t;
 			if (!types.TryGetValue (typeName, out t)) {
-				t = new MissingType (typeName);
+				t = new MissingType (typeName, this);
 				types.Add (typeName, t);
 			}
 
@@ -467,10 +581,12 @@ namespace Mono.CSharp
 	class MissingType : MetaType
 	{
 		readonly string full_name;
+		readonly MissingAssembly assembly;
 
-		public MissingType (string typeName)
+		public MissingType (string typeName, MissingAssembly assembly)
 		{
 			this.full_name = typeName;
+			this.assembly = assembly;
 		}
 
 		public override TypeAttributes Attributes {
@@ -492,9 +608,20 @@ namespace Mono.CSharp
 			}
 		}
 
+		internal override MetaType GetGenericTypeArgument (int index)
+		{
+			return new MissingType ("#" + index.ToString (), assembly);
+		}
+
+		public override bool IsGenericTypeDefinition {
+			get {
+				return full_name.IndexOf ('`') > 0;
+			}
+		}
+
 		public override Module Module {
 			get {
-				throw new NotImplementedException ();
+				return assembly.ManifestModule;
 			}
 		}
 	}

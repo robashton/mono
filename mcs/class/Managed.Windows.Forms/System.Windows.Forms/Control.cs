@@ -393,7 +393,8 @@ namespace System.Windows.Forms
 				buffered_graphics.Dispose ();
 			}
 			
-			public void Invalidate () {
+			public void Invalidate ()
+			{
 				if (InvalidRegion != null)
 					InvalidRegion.Dispose ();
 				InvalidRegion = new Region (parent.ClientRectangle);
@@ -1545,7 +1546,7 @@ namespace System.Windows.Forms
 
 			if (background_image == null) {
 				if (!tbstyle_flat) {
-					Rectangle paintRect = new Rectangle(pevent.ClipRectangle.X, pevent.ClipRectangle.Y, pevent.ClipRectangle.Width, pevent.ClipRectangle.Height);
+					Rectangle paintRect = pevent.ClipRectangle;
 					Brush pen = ThemeEngine.Current.ResPool.GetSolidBrush(BackColor);
 					pevent.Graphics.FillRectangle(pen, paintRect);
 				}
@@ -2383,7 +2384,7 @@ namespace System.Windows.Forms
 		[DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
 		public int Bottom {
 			get {
-				return bounds.Y+bounds.Height;
+				return this.bounds.Bottom;
 			}
 		}
 
@@ -3018,7 +3019,7 @@ namespace System.Windows.Forms
 		[DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
 		public int Left {
 			get {
-				return this.bounds.X;
+				return this.bounds.Left;
 			}
 
 			set {
@@ -3030,7 +3031,7 @@ namespace System.Windows.Forms
 		[MWFCategory("Layout")]
 		public Point Location {
 			get {
-				return new Point(bounds.X, bounds.Y);
+				return this.bounds.Location;
 			}
 
 			set {
@@ -3204,7 +3205,7 @@ namespace System.Windows.Forms
 		[DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
 		public int Right {
 			get {
-				return this.bounds.X+this.bounds.Width;
+				return this.bounds.Right;
 			}
 		}
 
@@ -3371,7 +3372,7 @@ namespace System.Windows.Forms
 		[DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
 		public int Top {
 			get {
-				return this.bounds.Y;
+				return this.bounds.Top;
 			}
 
 			set {
@@ -3513,7 +3514,7 @@ namespace System.Windows.Forms
 				}
 
 
-				create_params.ClassName = XplatUI.DefaultClassName;
+				create_params.ClassName = XplatUI.GetDefaultClassName (GetType ());
 				create_params.ClassStyle = (int)(XplatUIWin32.ClassStyle.CS_OWNDC | XplatUIWin32.ClassStyle.CS_DBLCLKS);
 				create_params.ExStyle = 0;
 				create_params.Param = 0;
@@ -3978,25 +3979,29 @@ namespace System.Windows.Forms
 			this.Visible = false;
 		}
 
-		public void Invalidate() {
-			Invalidate(ClientRectangle, false);
+		public void Invalidate ()
+		{
+			Invalidate (ClientRectangle, false);
 		}
 
-		public void Invalidate(bool invalidateChildren) {
-			Invalidate(ClientRectangle, invalidateChildren);
+		public void Invalidate (bool invalidateChildren)
+		{
+			Invalidate (ClientRectangle, invalidateChildren);
 		}
 
-		public void Invalidate(System.Drawing.Rectangle rc) {
-			Invalidate(rc, false);
+		public void Invalidate (Rectangle rc)
+		{
+			Invalidate (rc, false);
 		}
 
-		public void Invalidate(System.Drawing.Rectangle rc, bool invalidateChildren) {
+		public void Invalidate (Rectangle rc, bool invalidateChildren)
+		{
 			// Win32 invalidates control including when Width and Height is equal 0
 			// or is not visible, only Paint event must be care about this.
 			if (!IsHandleCreated)
 				return;
 
-			if (rc == Rectangle.Empty)
+			if (rc.IsEmpty)
 				rc = ClientRectangle;
 				
 			if  (rc.Width > 0 && rc.Height > 0) {
@@ -4020,14 +4025,17 @@ namespace System.Windows.Forms
 			OnInvalidated(new InvalidateEventArgs(rc));
 		}
 
-		public void Invalidate(System.Drawing.Region region) {
-			Invalidate(region, false);
+		public void Invalidate (Region region)
+		{
+			Invalidate (region, false);
 		}
 
-		public void Invalidate(System.Drawing.Region region, bool invalidateChildren) {
-			RectangleF bounds = region.GetBounds (CreateGraphics ());
-			Invalidate (new Rectangle ((int) bounds.X, (int) bounds.Y, (int) bounds.Width, (int) bounds.Height),
-					invalidateChildren);
+		public void Invalidate (Region region, bool invalidateChildren)
+		{
+			using (Graphics g = CreateGraphics ()){
+				RectangleF bounds = region.GetBounds (g);
+				Invalidate (new Rectangle ((int) bounds.X, (int) bounds.Y, (int) bounds.Width, (int) bounds.Height), invalidateChildren);
+			}
 		}
 
 		public object Invoke (Delegate method) {
@@ -5262,7 +5270,7 @@ namespace System.Windows.Forms
 					continue;
 
 				Hwnd hwnd = Hwnd.ObjectFromHandle (controls[i].Handle);
-				if (hwnd.zero_sized)
+				if (hwnd == null || hwnd.zero_sized)
 					continue;
 
 				children_to_order.Add (controls[i]);
@@ -5508,11 +5516,9 @@ namespace System.Windows.Forms
 		// can be found here: http://pluralsight.com/wiki/default.aspx/Craig/FlickerFreeControlDrawing.html
 		// and here http://msdn.microsoft.com/msdnmag/issues/06/03/WindowsFormsPerformance/
 		private void WmPaint (ref Message m) {
-			PaintEventArgs	paint_event;
-
 			IntPtr handle = Handle;
 
-			paint_event = XplatUI.PaintEventStart (ref m, handle, true);
+			PaintEventArgs paint_event = XplatUI.PaintEventStart (ref m, handle, true);
 
 			if (paint_event == null)
 				return;
