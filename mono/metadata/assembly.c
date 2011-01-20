@@ -65,6 +65,9 @@ static char **extra_gac_paths = NULL;
 #ifndef DISABLE_ASSEMBLY_REMAPPING
 /* The list of system assemblies what will be remapped to the running
  * runtime version. WARNING: this list must be sorted.
+ * The integer number is an index in the MonoRuntimeInfo structure, whose
+ * values can be found in domain.c - supported_runtimes. Look there
+ * to understand what remapping will be made.
  */
 static const AssemblyVersionMap framework_assemblies [] = {
 	{"Accessibility", 0},
@@ -112,6 +115,7 @@ static const AssemblyVersionMap framework_assemblies [] = {
 	{"System.Runtime.Serialization.Formatters.Soap", 0},
 	{"System.Security", 0},
 	{"System.ServiceProcess", 0},
+	{"System.Transactions", 0},
 	{"System.Web", 0},
 	{"System.Web.Abstractions", 2},
 	{"System.Web.Mobile", 0},
@@ -196,13 +200,23 @@ mono_public_tokens_are_equal (const unsigned char *pubt1, const unsigned char *p
 	return memcmp (pubt1, pubt2, 16) == 0;
 }
 
+/* Native Client can't get this info from an environment variable so */
+/* it's passed in to the runtime, or set manually by embedding code. */
+#ifdef __native_client__
+char* nacl_mono_path = NULL;
+#endif
+
 static void
 check_path_env (void)
 {
 	const char *path;
 	char **splitted, **dest;
 	
+#ifdef __native_client__
+	path = nacl_mono_path;
+#else
 	path = g_getenv ("MONO_PATH");
+#endif
 	if (!path)
 		return;
 
@@ -1600,7 +1614,7 @@ mono_assembly_load_from_full (MonoImage *image, const char*fname,
 	loaded_assemblies = g_list_prepend (loaded_assemblies, ass);
 	mono_assemblies_unlock ();
 
-#ifdef HOST_WIN32
+#ifdef ENABLE_COREE
 	if (image->is_module_handle)
 		mono_image_fixup_vtable (image);
 #endif
@@ -1647,7 +1661,15 @@ parse_public_key (const gchar *key, gchar** pubkey)
 	keylen = strlen (key) >> 1;
 	if (keylen < 1)
 		return FALSE;
-	
+
+	/* allow the ECMA standard key */
+	if (strcmp (key, "00000000000000000400000000000000") == 0) {
+		if (pubkey) {
+			arr = g_strdup ("b77a5c561934e089");
+			*pubkey = arr;
+		}
+		return TRUE;
+	}
 	val = g_ascii_xdigit_value (key [0]) << 4;
 	val |= g_ascii_xdigit_value (key [1]);
 	switch (val) {
@@ -2445,7 +2467,15 @@ mono_assembly_apply_binding (MonoAssemblyName *aname, MonoAssemblyName *dest_nam
 
 		mono_loader_lock ();
 		mono_domain_lock (domain);
-		info = get_per_domain_assembly_binding_info (domain, aname);
+		info2 = get_per_domain_assembly_binding_info (domain, aname);
+
+		if (info2) {
+			info = g_memdup (info2, sizeof (MonoAssemblyBindingInfo));
+			info->name = g_strdup (info2->name);
+			info->culture = g_strdup (info2->culture);
+			info->domain_id = domain->domain_id;
+		}
+
 		mono_domain_unlock (domain);
 		mono_loader_unlock ();
 	}
@@ -2895,6 +2925,27 @@ mono_assemblies_cleanup (void)
 	free_assembly_load_hooks ();
 	free_assembly_search_hooks ();
 	free_assembly_preload_hooks ();
+}
+
+/*LOCKING assumes loader lock is held*/
+void
+mono_assembly_cleanup_domain_bindings (guint32 domain_id)
+{
+	GSList **iter = &loaded_assembly_bindings;
+
+	while (*iter) {
+		GSList *l = *iter;
+		MonoAssemblyBindingInfo *info = l->data;
+
+		if (info->domain_id == domain_id) {
+			*iter = l->next;
+			mono_assembly_binding_info_free (info);
+			g_free (info);
+			g_slist_free_1 (l);
+		} else {
+			iter = &l->next;
+		}
+	}
 }
 
 /*

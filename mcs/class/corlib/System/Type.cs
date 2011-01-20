@@ -35,6 +35,7 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Reflection.Emit;
 using System.Collections;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using System.Globalization;
@@ -808,13 +809,13 @@ namespace System {
 			if (filter == null)
 				throw new ArgumentNullException ("filter");
 
-			ArrayList ifaces = new ArrayList ();
+			var ifaces = new List<Type> ();
 			foreach (Type iface in GetInterfaces ()) {
 				if (filter (iface, filterCriteria))
 					ifaces.Add (iface);
 			}
 
-			return (Type []) ifaces.ToArray (typeof (Type));
+			return ifaces.ToArray ();
 		}
 		
 		public Type GetInterface (string name) {
@@ -1649,7 +1650,7 @@ namespace System {
 		}			
 
 
-#if NET_4_0 || BOOTSTRAP_NET_4_0
+#if NET_4_0
 		public virtual bool IsEquivalentTo (Type other)
 		{
 			return this == other;

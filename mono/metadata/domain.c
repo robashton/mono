@@ -1271,8 +1271,9 @@ mono_init_internal (const char *filename, const char *exe_filename, const char *
 #ifdef HOST_WIN32
 	/* Avoid system error message boxes. */
 	SetErrorMode (SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
-
+#ifdef ENABLE_COREE
 	mono_load_coree (exe_filename);
+#endif
 #endif
 
 	mono_perfcounters_init ();
@@ -1310,7 +1311,7 @@ mono_init_internal (const char *filename, const char *exe_filename, const char *
 		 * exe_image, and close it during shutdown.
 		 */
 		get_runtimes_from_exe (exe_filename, &exe_image, runtimes);
-#ifdef HOST_WIN32
+#ifdef ENABLE_COREE
 		if (!exe_image) {
 			exe_image = mono_assembly_open_from_bundle (exe_filename, NULL, FALSE);
 			if (!exe_image)
@@ -2195,6 +2196,58 @@ mono_domain_code_commit (MonoDomain *domain, void *data, int size, int newsize)
 	mono_code_manager_commit (domain->code_mp, data, size, newsize);
 	mono_domain_unlock (domain);
 }
+
+#if defined(__native_client_codegen__) && defined(__native_client__)
+/*
+ * Given the temporary buffer (allocated by mono_domain_code_reserve) into which
+ * we are generating code, return a pointer to the destination in the dynamic 
+ * code segment into which the code will be copied when mono_domain_code_commit
+ * is called.
+ * LOCKING: Acquires the domain lock.
+ */
+void *
+nacl_domain_get_code_dest (MonoDomain *domain, void *data)
+{
+	void *dest;
+	mono_domain_lock (domain);
+	dest = nacl_code_manager_get_code_dest (domain->code_mp, data);
+	mono_domain_unlock (domain);
+	return dest;
+}
+
+/* 
+ * Convenience function which calls mono_domain_code_commit to validate and copy
+ * the code. The caller sets *buf_base and *buf_size to the start and size of
+ * the buffer (allocated by mono_domain_code_reserve), and *code_end to the byte
+ * after the last instruction byte. On return, *buf_base will point to the start
+ * of the copied in the code segment, and *code_end will point after the end of 
+ * the copied code.
+ */
+void
+nacl_domain_code_validate (MonoDomain *domain, guint8 **buf_base, int buf_size, guint8 **code_end)
+{
+	guint8 *tmp = nacl_domain_get_code_dest (domain, *buf_base);
+	mono_domain_code_commit (domain, *buf_base, buf_size, *code_end - *buf_base);
+	*code_end = tmp + (*code_end - *buf_base);
+	*buf_base = tmp;
+}
+
+#else
+
+/* no-op versions of Native Client functions */
+
+void *
+nacl_domain_get_code_dest (MonoDomain *domain, void *data)
+{
+	return data;
+}
+
+void
+nacl_domain_code_validate (MonoDomain *domain, guint8 **buf_base, int buf_size, guint8 **code_end)
+{
+}
+
+#endif
 
 /*
  * mono_domain_code_foreach:

@@ -30,10 +30,91 @@ namespace Mono.CSharp
 	//
 	public class ModuleContainer : TypeContainer
 	{
-		public CharSet DefaultCharSet = CharSet.Ansi;
+		//
+		// Compiler generated container for static data
+		//
+		sealed class StaticDataContainer : CompilerGeneratedClass
+		{
+			Dictionary<int, Struct> size_types;
+			new int fields;
+#if !STATIC
+			static MethodInfo set_data;
+#endif
+
+			public StaticDataContainer (ModuleContainer module)
+				: base (module, new MemberName ("<PrivateImplementationDetails>" + module.builder.ModuleVersionId.ToString ("B"), Location.Null), Modifiers.STATIC)
+			{
+				size_types = new Dictionary<int, Struct> ();
+			}
+
+			public override void CloseType ()
+			{
+				base.CloseType ();
+
+				foreach (var entry in size_types) {
+					entry.Value.CloseType ();
+				}
+			}
+
+			public FieldSpec DefineInitializedData (byte[] data, Location loc)
+			{
+				Struct size_type;
+				if (!size_types.TryGetValue (data.Length, out size_type)) {
+					//
+					// Build common type for this data length. We cannot use
+					// DefineInitializedData because it creates public type,
+					// and its name is not unique among modules
+					//
+					size_type = new Struct (null, this, new MemberName ("$ArrayType=" + data.Length, Location), Modifiers.PRIVATE | Modifiers.COMPILER_GENERATED, null);
+					size_type.CreateType ();
+					size_type.DefineType ();
+
+					size_types.Add (data.Length, size_type);
+
+					var pa = Module.PredefinedAttributes.StructLayout;
+					if (pa.Constructor != null || pa.ResolveConstructor (Location, TypeManager.short_type)) {
+						var argsEncoded = new AttributeEncoder (false);
+						argsEncoded.Encode ((short) LayoutKind.Explicit);
+
+						var field_size = pa.GetField ("Size", TypeManager.int32_type, Location);
+						var pack = pa.GetField ("Pack", TypeManager.int32_type, Location);
+						if (field_size != null) {
+							argsEncoded.EncodeNamedArguments (
+								new[] { field_size, pack },
+								new[] { new IntConstant ((int) data.Length, Location), new IntConstant (1, Location) }
+							);
+						}
+
+						pa.EmitAttribute (size_type.TypeBuilder, argsEncoded);
+					}
+				}
+
+				var name = "$field-" + fields.ToString ("X");
+				++fields;
+				const Modifiers fmod = Modifiers.STATIC | Modifiers.INTERNAL;
+				var fbuilder = TypeBuilder.DefineField (name, size_type.CurrentType.GetMetaInfo (), ModifiersExtensions.FieldAttr (fmod) | FieldAttributes.HasFieldRVA);
+#if STATIC
+				fbuilder.__SetDataAndRVA (data);
+#else
+				if (set_data == null)
+					set_data = typeof (FieldBuilder).GetMethod ("SetRVAData", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+				try {
+					set_data.Invoke (fbuilder, new object[] { data });
+				} catch {
+					Report.RuntimeMissingSupport (loc, "SetRVAData");
+				}
+#endif
+
+				return new FieldSpec (CurrentType, null, size_type.CurrentType, fbuilder, fmod);
+			}
+		}
+
+		public CharSet? DefaultCharSet;
 		public TypeAttributes DefaultCharSetType = TypeAttributes.AnsiClass;
 
 		Dictionary<int, List<AnonymousTypeClass>> anonymous_types;
+		StaticDataContainer static_data;
 
 		AssemblyDefinition assembly;
 		readonly CompilerContext context;
@@ -41,12 +122,7 @@ namespace Mono.CSharp
 		Dictionary<string, RootNamespace> alias_ns;
 
 		ModuleBuilder builder;
-		int static_data_counter;
 
-		// HACK
-		public List<Enum> hack_corlib_enums = new List<Enum> ();
-
-		bool has_default_charset;
 		bool has_extenstion_method;
 
 		PredefinedAttributes predefined_attributes;
@@ -95,7 +171,7 @@ namespace Mono.CSharp
 
 		public bool HasDefaultCharSet {
 			get {
-				return has_default_charset;
+				return DefaultCharSet.HasValue;
 			}
 		}
 
@@ -184,7 +260,25 @@ namespace Mono.CSharp
 				return;
 			}
 
-			if (a.Type == pa.CLSCompliant) {
+			if (a.Type == pa.DefaultCharset) {
+				switch (a.GetCharSetValue ()) {
+				case CharSet.Ansi:
+				case CharSet.None:
+					break;
+				case CharSet.Auto:
+					DefaultCharSet = CharSet.Auto;
+					DefaultCharSetType = TypeAttributes.AutoClass;
+					break;
+				case CharSet.Unicode:
+					DefaultCharSet = CharSet.Unicode;
+					DefaultCharSetType = TypeAttributes.UnicodeClass;
+					break;
+				default:
+					Report.Error (1724, a.Location, "Value specified for the argument to `{0}' is not valid",
+						a.GetSignatureForError ());
+					break;
+				}
+			} else if (a.Type == pa.CLSCompliant) {
 				Attribute cls = DeclaringAssembly.CLSCompliantAttribute;
 				if (cls == null) {
 					Report.Warning (3012, 1, a.Location,
@@ -200,10 +294,8 @@ namespace Mono.CSharp
 			builder.SetCustomAttribute ((ConstructorInfo) ctor.GetMetaInfo (), cdata);
 		}
 
-		public new void CloseType ()
+		public override void CloseType ()
 		{
-			HackCorlibEnums ();
-
 			foreach (TypeContainer tc in types) {
 				tc.CloseType ();
 			}
@@ -211,15 +303,6 @@ namespace Mono.CSharp
 			if (compiler_generated != null)
 				foreach (CompilerGeneratedClass c in compiler_generated)
 					c.CloseType ();
-
-			//
-			// If we have a <PrivateImplementationDetails> class, close it
-			//
-			if (TypeBuilder != null) {
-				var cg = PredefinedAttributes.CompilerGenerated;
-				cg.EmitAttribute (TypeBuilder);
-				TypeBuilder.CreateType ();
-			}
 		}
 
 		public TypeBuilder CreateBuilder (string name, TypeAttributes attr, int typeSize)
@@ -251,11 +334,7 @@ namespace Mono.CSharp
 			builder = assembly.CreateModuleBuilder ();
 
 			// FIXME: Temporary hack for repl to reset
-			TypeBuilder = null;
-
-			// TODO: It should be done much later when the types are resolved
-			// but that require DefineType clean-up
-			ResolveGlobalAttributes ();
+			static_data = null;
 
 			foreach (TypeContainer tc in types)
 				tc.CreateType ();
@@ -290,8 +369,6 @@ namespace Mono.CSharp
 
 			foreach (var tc in types)
 				tc.DefineConstants ();
-
-			HackCorlib ();
 
 			foreach (TypeContainer tc in types)
 				tc.EmitType ();
@@ -339,52 +416,6 @@ namespace Mono.CSharp
 			return "<module>";
 		}
 
-		void HackCorlib ()
-		{
-#if !STATIC
-			if (RootContext.StdLib)
-				return;
-
-			//
-			// HACK: When building corlib mcs uses loaded mscorlib which
-			// has different predefined types and this method sets mscorlib types
-			// to be same to avoid type check errors in CreateType.
-			//
-			var type = typeof (Type);
-			var system_4_type_arg = new[] { type, type, type, type };
-
-			MethodInfo set_corlib_type_builders =
-				typeof (System.Reflection.Emit.AssemblyBuilder).GetMethod (
-				"SetCorlibTypeBuilders", BindingFlags.NonPublic | BindingFlags.Instance, null,
-				system_4_type_arg, null);
-
-			if (set_corlib_type_builders == null) {
-				Compiler.Report.Warning (-26, 3,
-					"The compilation may fail due to missing `System.Reflection.Emit.AssemblyBuilder.SetCorlibTypeBuilders(...)' method");
-				return;
-			}
-
-			object[] args = new object[4];
-			args[0] = TypeManager.object_type.GetMetaInfo ();
-			args[1] = TypeManager.value_type.GetMetaInfo ();
-			args[2] = TypeManager.enum_type.GetMetaInfo ();
-			args[3] = TypeManager.void_type.GetMetaInfo ();
-			set_corlib_type_builders.Invoke (assembly.Builder, args);
-#endif
-		}
-
-		void HackCorlibEnums ()
-		{
-			if (RootContext.StdLib)
-				return;
-
-			// Another Mono corlib HACK
-			// mono_class_layout_fields requires to have enums created
-			// before creating a class which used the enum for any of its fields
-			foreach (var e in hack_corlib_enums)
-				e.CloseType ();
-		}
-
 		public void InitializePredefinedTypes ()
 		{
 			predefined_attributes = new PredefinedAttributes (this);
@@ -397,31 +428,19 @@ namespace Mono.CSharp
 		}
 
 		//
-		// Makes an initialized struct, returns the field builder that
-		// references the data.  Thanks go to Sergey Chaban for researching
-		// how to do this.  And coming up with a shorter mechanism than I
-		// was able to figure out.
+		// Makes const data field inside internal type container
 		//
-		// This works but makes an implicit public struct $ArrayType$SIZE and
-		// makes the fields point to it.  We could get more control if we did
-		// use instead:
-		//
-		// 1. DefineNestedType on the impl_details_class with our struct.
-		//
-		// 2. Define the field on the impl_details_class
-		//
-		public FieldBuilder MakeStaticData (byte[] data)
+		public FieldSpec MakeStaticData (byte[] data, Location loc)
 		{
-			if (TypeBuilder == null) {
-				TypeBuilder = builder.DefineType ("<PrivateImplementationDetails>",
-					TypeAttributes.NotPublic, TypeManager.object_type.GetMetaInfo ());
+			if (static_data == null) {
+				static_data = new StaticDataContainer (this);
+				static_data.CreateType ();
+				static_data.DefineType ();
+
+				AddCompilerGeneratedClass (static_data);
 			}
 
-			var fb = TypeBuilder.DefineInitializedData (
-				"$$field-" + (static_data_counter++), data,
-				FieldAttributes.Static | FieldAttributes.Assembly);
-
-			return fb;
+			return static_data.DefineInitializedData (data, loc);
 		}
 
 		protected override bool AddMemberType (TypeContainer ds)
@@ -438,54 +457,9 @@ namespace Mono.CSharp
 			base.RemoveMemberType (ds);
 		}
 
-		/// <summary>
-		/// It is called very early therefore can resolve only predefined attributes
-		/// </summary>
-		void ResolveGlobalAttributes ()
-		{
-			if (OptAttributes == null)
-				return;
-
-			if (!OptAttributes.CheckTargets ())
-				return;
-
-			// FIXME: Define is wrong as the type may not exist yet
-			var DefaultCharSet_attr = new PredefinedAttribute (this, "System.Runtime.InteropServices", "DefaultCharSetAttribute");
-			DefaultCharSet_attr.Define ();
-			Attribute a = ResolveModuleAttribute (DefaultCharSet_attr);
-			if (a != null) {
-				has_default_charset = true;
-				DefaultCharSet = a.GetCharSetValue ();
-				switch (DefaultCharSet) {
-				case CharSet.Ansi:
-				case CharSet.None:
-					break;
-				case CharSet.Auto:
-					DefaultCharSetType = TypeAttributes.AutoClass;
-					break;
-				case CharSet.Unicode:
-					DefaultCharSetType = TypeAttributes.UnicodeClass;
-					break;
-				default:
-					Report.Error (1724, a.Location, "Value specified for the argument to `{0}' is not valid", 
-						DefaultCharSet_attr.GetSignatureForError ());
-					break;
-				}
-			}
-		}
-
 		public Attribute ResolveAssemblyAttribute (PredefinedAttribute a_type)
 		{
 			Attribute a = OptAttributes.Search ("assembly", a_type);
-			if (a != null) {
-				a.Resolve ();
-			}
-			return a;
-		}
-
-		Attribute ResolveModuleAttribute (PredefinedAttribute a_type)
-		{
-			Attribute a = OptAttributes.Search ("module", a_type);
 			if (a != null) {
 				a.Resolve ();
 			}

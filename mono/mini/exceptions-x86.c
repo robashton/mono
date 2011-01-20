@@ -142,7 +142,7 @@ win32_handle_stack_overflow (EXCEPTION_POINTERS* ep, struct sigcontext *sctx)
 	do {
 		MonoContext new_ctx;
 
-		mono_arch_find_jit_info (domain, jit_tls, &rji, &ctx, &new_ctx, &lmf, &frame);
+		mono_arch_find_jit_info (domain, jit_tls, &rji, &ctx, &new_ctx, &lmf, NULL, &frame);
 		if (!frame.ji) {
 			g_warning ("Exception inside function without unwind info");
 			g_assert_not_reached ();
@@ -308,6 +308,8 @@ mono_arch_get_restore_context (MonoTrampInfo **info, gboolean aot)
 	/* jump to the saved IP */
 	x86_ret (code);
 
+	nacl_global_codeman_validate(&start, 128, &code);
+
 	if (info)
 		*info = mono_tramp_info_create (g_strdup_printf ("restore_context"), start, code - start, ji, unwind_ops);
 	else {
@@ -335,11 +337,7 @@ mono_arch_get_call_filter (MonoTrampInfo **info, gboolean aot)
 	guint8 *code;
 	MonoJumpInfo *ji = NULL;
 	GSList *unwind_ops = NULL;
-#ifdef __native_client_codegen__
-	guint kMaxCodeSize = 128;
-#else
-	guint kMaxCodeSize = 64;
-#endif  /* __native_client_codegen__ */
+	guint kMaxCodeSize = NACL_SIZE (64, 128);
 
 	/* call_filter (MonoContext *ctx, unsigned long eip) */
 	start = code = mono_global_codeman_reserve (kMaxCodeSize);
@@ -386,6 +384,8 @@ mono_arch_get_call_filter (MonoTrampInfo **info, gboolean aot)
 	x86_pop_reg (code, X86_EBX);
 	x86_leave (code);
 	x86_ret (code);
+
+	nacl_global_codeman_validate(&start, kMaxCodeSize, &code);
 
 	if (info)
 		*info = mono_tramp_info_create (g_strdup_printf ("call_filter"), start, code - start, ji, unwind_ops);
@@ -515,11 +515,8 @@ get_throw_trampoline (const char *name, gboolean rethrow, gboolean llvm, gboolea
 	int i, stack_size, stack_offset, arg_offsets [5], regs_offset;
 	MonoJumpInfo *ji = NULL;
 	GSList *unwind_ops = NULL;
-#ifdef __native_client_codegen__
-	guint kMaxCodeSize = 256;
-#else
-	guint kMaxCodeSize = 128;
-#endif
+	guint kMaxCodeSize = NACL_SIZE (128, 256);
+
 	start = code = mono_global_codeman_reserve (kMaxCodeSize);
 
 	stack_size = 128;
@@ -628,6 +625,8 @@ get_throw_trampoline (const char *name, gboolean rethrow, gboolean llvm, gboolea
 		x86_call_code (code, resume_unwind ? (mono_x86_resume_unwind) : (corlib ? (gpointer)mono_x86_throw_corlib_exception : (gpointer)mono_x86_throw_exception));
 	}
 	x86_breakpoint (code);
+
+	nacl_global_codeman_validate(&start, kMaxCodeSize, &code);
 
 	g_assert ((code - start) < kMaxCodeSize);
 
@@ -742,7 +741,8 @@ mono_arch_exceptions_init (void)
 gboolean
 mono_arch_find_jit_info (MonoDomain *domain, MonoJitTlsData *jit_tls, 
 							 MonoJitInfo *ji, MonoContext *ctx, 
-							 MonoContext *new_ctx, MonoLMF **lmf, 
+							 MonoContext *new_ctx, MonoLMF **lmf,
+							 mgreg_t **save_locations,
 							 StackFrameInfo *frame)
 {
 	gpointer ip = MONO_CONTEXT_GET_IP (ctx);
@@ -781,7 +781,8 @@ mono_arch_find_jit_info (MonoDomain *domain, MonoJitTlsData *jit_tls,
 
 		mono_unwind_frame (unwind_info, unwind_info_len, ji->code_start, 
 						   (guint8*)ji->code_start + ji->code_size,
-						   ip, regs, MONO_MAX_IREGS + 1, &cfa);
+						   ip, regs, MONO_MAX_IREGS + 1,
+						   save_locations, MONO_MAX_IREGS, &cfa);
 
 		new_ctx->eax = regs [X86_EAX];
 		new_ctx->ebx = regs [X86_EBX];

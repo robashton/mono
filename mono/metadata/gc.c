@@ -300,8 +300,14 @@ object_register_finalizer (MonoObject *obj, void (*callback)(void *, void*))
 #elif defined(HAVE_SGEN_GC)
 	if (obj == NULL)
 		mono_raise_exception (mono_get_exception_argument_null ("obj"));
-				      
-	mono_gc_register_for_finalization (obj, callback);
+
+	/*
+	 * If we register finalizers for domains that are unloading we might
+	 * end up running them while or after the domain is being cleared, so
+	 * the objects will not be valid anymore.
+	 */
+	if (!mono_domain_is_unloading (obj->vtable->domain))
+		mono_gc_register_for_finalization (obj, callback);
 #endif
 }
 

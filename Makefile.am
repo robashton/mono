@@ -19,7 +19,16 @@ DIST_SUBDIRS = po libgc eglib mono ikvm-native support data runtime scripts man 
 endif
 endif
 
-EXTRA_DIST= nls.m4 po.m4 progtest.m4 mono-uninstalled.pc.in build-mingw32.sh LICENSE mkinstalldirs autogen.sh 
+EXTRA_DIST= \
+	    LICENSE \
+	    autogen.sh \
+	    build-mingw32.sh \
+	    mkinstalldirs \
+	    mono-uninstalled.pc.in \
+	    nls.m4 \
+	    po.m4 \
+	    progtest.m4 \
+	    winconfig.h
 
 DISTCHECK_CONFIGURE_FLAGS = EXTERNAL_MCS=false EXTERNAL_RUNTIME=false
 
@@ -37,7 +46,8 @@ DISTCLEANFILES= mono-uninstalled.pc
 # building with monolite
 mcslib = $(mcs_topdir)/class/lib
 monolite = $(mcslib)/monolite
-monolite_url = http://mono.ximian.com/daily/monolite-latest.tar.gz
+mono_corlib_version = $(shell sed -n "s/\#define MONO_CORLIB_VERSION //p" $(srcdir)/mono/metadata/appdomain.c)
+monolite_url = http://mono.ximian.com/daily/monolite-$(mono_corlib_version)-latest.tar.gz
 .PHONY: get-monolite-latest 
 get-monolite-latest:
 	-rm -fr $(mcslib)/monolite-*

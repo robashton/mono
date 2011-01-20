@@ -22,7 +22,7 @@
 //
 //
 
-#if NET_4_0 || BOOTSTRAP_NET_4_0
+#if NET_4_0
 using System;
 using System.Collections.Concurrent;
 
@@ -46,7 +46,7 @@ namespace System.Threading.Tasks
 			workers = new ThreadWorker [maxWorker];
 			
 			for (int i = 0; i < maxWorker; i++) {
-				workers [i] = new ThreadWorker (this, workers, i, workQueue, priority, pulseHandle);
+				workers [i] = new ThreadWorker (workers, i, workQueue, new CyclicDeque<Task> (), priority, pulseHandle);
 				workers [i].Pulse ();
 			}
 		}
@@ -63,33 +63,36 @@ namespace System.Threading.Tasks
 		{
 			if (task.IsCompleted)
 				return;
+
+			ManualResetEventSlim evt = new ManualResetEventSlim (false);
+			task.ContinueWith (_ => evt.Set (), TaskContinuationOptions.ExecuteSynchronously);
+			if (evt.IsSet)
+				return;
 			
-			ParticipateUntil (() => task.IsCompleted);
+			ParticipateUntilInternal (task, evt, -1);
 		}
 		
-		public bool ParticipateUntil (Task task, Func<bool> predicate)
+		public bool ParticipateUntil (Task task, ManualResetEventSlim evt, int millisecondsTimeout)
 		{
 			if (task.IsCompleted)
 				return false;
+
+			bool isFromPredicate = true;
+			task.ContinueWith (_ => { isFromPredicate = false; evt.Set (); }, TaskContinuationOptions.ExecuteSynchronously);
 			
-			bool isFromPredicate = false;
-			
-			ParticipateUntil (delegate {
-				if (predicate ()) {
-					isFromPredicate = true;
-					return true;
-				}
-				return task.IsCompleted;
-			});
-				
+			ParticipateUntilInternal (task, evt, millisecondsTimeout);
+
 			return isFromPredicate;
 		}
 		
-		// Called with Task.WaitAll(someTasks) or Task.WaitAny(someTasks) so that we can remove ourselves
-		// also when our wait condition is ok
-		public void ParticipateUntil (Func<bool> predicate)
-		{	
-			ThreadWorker.WorkerMethod (predicate, workQueue, workers, pulseHandle);
+		internal void ParticipateUntilInternal (Task self, ManualResetEventSlim evt, int millisecondsTimeout)
+		{
+			ThreadWorker.ParticipativeWorkerMethod (self, evt, millisecondsTimeout, workQueue, workers, pulseHandle);
+		}
+
+		static bool TaskCompletedPredicate (Task self)
+		{
+			return self.IsCompleted;
 		}
 		
 		public void PulseAll ()
@@ -120,7 +123,8 @@ namespace System.Threading.Tasks
 
 		protected override bool TryExecuteTaskInline (Task task, bool taskWasPreviouslyQueued)
 		{
-			throw new System.NotImplementedException();
+			task.Execute (null);
+			return true;
 		}
 		
 		public override int MaximumConcurrencyLevel {

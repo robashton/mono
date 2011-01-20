@@ -115,7 +115,10 @@ opt_funcs [sizeof (int) * 8] = {
 };
 
 #ifdef __native_client_codegen__
-extern guint8 nacl_align_byte;
+extern gint8 nacl_align_byte;
+#endif
+#ifdef __native_client__
+extern char *nacl_mono_path;
 #endif
 
 #define DEFAULT_OPTIMIZATIONS (	\
@@ -1245,8 +1248,10 @@ BOOL APIENTRY DllMain (HMODULE module_handle, DWORD reason, LPVOID reserved)
 		mono_install_runtime_load (mini_init);
 		break;
 	case DLL_PROCESS_DETACH:
+#ifdef ENABLE_COREE
 		if (coree_module_handle)
 			FreeLibrary (coree_module_handle);
+#endif
 		break;
 	}
 	return TRUE;
@@ -1388,7 +1393,7 @@ mono_main (int argc, char* argv[])
 			char *build = mono_get_runtime_build_info ();
 			char *gc_descr;
 
-			g_print ("Mono JIT compiler version %s\nCopyright (C) 2002-2010 Novell, Inc and Contributors. www.mono-project.com\n", build);
+			g_print ("Mono JIT compiler version %s\nCopyright (C) 2002-2011 Novell, Inc and Contributors. www.mono-project.com\n", build);
 			g_free (build);
 			g_print (info);
 			gc_descr = mono_gc_get_description ();
@@ -1644,7 +1649,11 @@ mono_main (int argc, char* argv[])
 			mono_use_llvm = FALSE;
 #ifdef __native_client_codegen__
 		} else if (strcmp (argv [i], "--nacl-align-mask-off") == 0){
-			nacl_align_byte = 0xff;	
+			nacl_align_byte = -1; /* 0xff */
+#endif
+#ifdef __native_client__
+		} else if (strcmp (argv [i], "--nacl-mono-path") == 0){
+			nacl_mono_path = g_strdup(argv[++i]);
 #endif
 		} else {
 			fprintf (stderr, "Unknown command line option: '%s'\n", argv [i]);
@@ -1655,7 +1664,7 @@ mono_main (int argc, char* argv[])
 #ifdef __native_client_codegen__
 	if (getenv ("MONO_NACL_ALIGN_MASK_OFF"))
 	{
-		nacl_align_byte = 0xff;
+		nacl_align_byte = -1; /* 0xff */
 	}
 #endif
 

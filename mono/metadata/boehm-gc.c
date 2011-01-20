@@ -105,6 +105,8 @@ mono_gc_base_init (void)
 
 		GC_stackbottom = (char*)ss.ss_sp;
 	}
+#elif defined(__native_client__)
+	/* Do nothing, GC_stackbottom is set correctly in libgc */
 #else
 	{
 		int dummy;
@@ -1115,6 +1117,43 @@ void*
 mono_gc_get_nursery (int *shift_bits, size_t *size)
 {
 	return NULL;
+}
+
+gboolean
+mono_gc_precise_stack_mark_enabled (void)
+{
+	return FALSE;
+}
+
+FILE *
+mono_gc_get_logfile (void)
+{
+	return NULL;
+}
+
+void
+mono_gc_conservatively_scan_area (void *start, void *end)
+{
+	g_assert_not_reached ();
+}
+
+void *
+mono_gc_scan_object (void *obj)
+{
+	g_assert_not_reached ();
+	return NULL;
+}
+
+gsize*
+mono_gc_get_bitmap_for_descr (void *descr, int *numbits)
+{
+	g_assert_not_reached ();
+	return NULL;
+}
+
+void
+mono_gc_set_gc_callbacks (MonoGCCallbacks *callbacks)
+{
 }
 
 /*

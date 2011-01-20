@@ -34,6 +34,7 @@
 using System;
 using System.Collections;
 using System.Configuration;
+using System.Globalization;
 using System.IO;
 using System.Net.Cache;
 using System.Net.Sockets;
@@ -109,6 +110,7 @@ namespace System.Net
 			Response
 		}
 		NtlmAuthState ntlm_auth_state;
+		string host;
 
 		// Constructors
 		static HttpWebRequest ()
@@ -162,6 +164,7 @@ namespace System.Net
 			sendChunked = info.GetBoolean ("sendChunked");
 			timeout = info.GetInt32 ("timeout");
 			redirects = info.GetInt32 ("redirects");
+			host = info.GetString ("host");
 		}
 		
 		// Properties
@@ -293,7 +296,23 @@ namespace System.Net
 			get { return credentials; }
 			set { credentials = value; }
 		}
-
+#if NET_4_0
+		public DateTime Date {
+			get {
+				string date = webHeaders ["Date"];
+				if (date == null)
+					return DateTime.MinValue;
+				return DateTime.ParseExact (date, "r", CultureInfo.InvariantCulture).ToLocalTime ();
+			}
+			set {
+				if (value == null) {
+					webHeaders.RemoveInternal ("Date");
+				} else {
+					webHeaders.RemoveAndAdd ("Date", value.ToUniversalTime ().ToString ("r", CultureInfo.InvariantCulture));
+				}
+			}
+		}
+#endif
 		[MonoTODO]
 		public static new RequestCachePolicy DefaultCachePolicy
 		{
@@ -352,7 +371,55 @@ namespace System.Net
 				webHeaders = newHeaders;
 			}
 		}
-		
+#if NET_4_0
+		public
+#else
+		internal
+#endif
+		string Host {
+			get {
+				if (host == null)
+					return actualUri.Authority;
+				return host;
+			}
+			set {
+				if (value == null)
+					throw new ArgumentNullException ("value");
+
+				if (!CheckValidHost (value))
+					throw new ArgumentException ("Invalid host: " + value);
+
+				host = value;
+			}
+		}
+
+		static char [] colon = { ':' };
+		static bool CheckValidHost (string val)
+		{
+			if (val == null)
+				throw new ArgumentNullException ("value");
+
+			if (val.Length == 0)
+				return false;
+
+			if (val [0] == '.')
+				return false;
+
+			string [] parts = val.Split ('.');
+			int l = parts.Length;
+			string [] last = parts [l - 1].Split (colon, 2);
+			if (last.Length == 2) {
+				parts [l - 1] = last [0];
+				ushort port;
+				if (!UInt16.TryParse (parts [1], out port))
+					return false;
+			}
+
+			// MS does not enforce a max. 255 length
+			// MS does not complain about a leading dash or all numbers...
+			return true;
+		}
+
 		public DateTime IfModifiedSince {
 			get { 
 				string str = webHeaders ["If-Modified-Since"];
@@ -575,43 +642,99 @@ namespace System.Net
 		
 		public void AddRange (int range)
 		{
-			AddRange ("bytes", range);
+			AddRange ("bytes", (long) range);
 		}
 		
 		public void AddRange (int from, int to)
 		{
-			AddRange ("bytes", from, to);
+			AddRange ("bytes", (long) from, (long) to);
 		}
 		
 		public void AddRange (string rangeSpecifier, int range)
 		{
-			if (rangeSpecifier == null)
-				throw new ArgumentNullException ("rangeSpecifier");
-			string value = webHeaders ["Range"];
-			if (value == null || value.Length == 0) 
-				value = rangeSpecifier + "=";
-			else if (value.ToLower ().StartsWith (rangeSpecifier.ToLower () + "="))
-				value += ",";
-			else
-				throw new InvalidOperationException ("rangeSpecifier");
-			webHeaders.RemoveAndAdd ("Range", value + range + "-");	
+			AddRange (rangeSpecifier, (long) range);
 		}
 		
 		public void AddRange (string rangeSpecifier, int from, int to)
 		{
+			AddRange (rangeSpecifier, (long) from, (long) to);
+		}
+#if NET_4_0
+		public
+#else
+		internal
+#endif
+		void AddRange (long range)
+		{
+			AddRange ("bytes", (long) range);
+		}
+
+#if NET_4_0
+		public
+#else
+		internal
+#endif
+		void AddRange (long from, long to)
+		{
+			AddRange ("bytes", from, to);
+		}
+
+#if NET_4_0
+		public
+#else
+		internal
+#endif
+		void AddRange (string rangeSpecifier, long range)
+		{
 			if (rangeSpecifier == null)
 				throw new ArgumentNullException ("rangeSpecifier");
-			if (from < 0 || to < 0 || from > to)
-				throw new ArgumentOutOfRangeException ();			
-			string value = webHeaders ["Range"];
-			if (value == null || value.Length == 0) 
-				value = rangeSpecifier + "=";
-			else if (value.ToLower ().StartsWith (rangeSpecifier.ToLower () + "="))
-				value += ",";
+			if (!WebHeaderCollection.IsHeaderValue (rangeSpecifier))
+				throw new ArgumentException ("Invalid range specifier", "rangeSpecifier");
+
+			string r = webHeaders ["Range"];
+			if (r == null)
+				r = rangeSpecifier + "=";
+			else {
+				string old_specifier = r.Substring (0, r.IndexOf ('='));
+				if (String.Compare (old_specifier, rangeSpecifier, StringComparison.OrdinalIgnoreCase) != 0)
+					throw new InvalidOperationException ("A different range specifier is already in use");
+				r += ",";
+			}
+
+			string n = range.ToString (CultureInfo.InvariantCulture);
+			if (range < 0)
+				r = r + "0" + n;
 			else
-				throw new InvalidOperationException ("rangeSpecifier");
-			webHeaders.RemoveAndAdd ("Range", value + from + "-" + to);	
+				r = r + n + "-";
+			webHeaders.RemoveAndAdd ("Range", r);
 		}
+
+#if NET_4_0
+		public
+#else
+		internal
+#endif
+		void AddRange (string rangeSpecifier, long from, long to)
+		{
+			if (rangeSpecifier == null)
+				throw new ArgumentNullException ("rangeSpecifier");
+			if (!WebHeaderCollection.IsHeaderValue (rangeSpecifier))
+				throw new ArgumentException ("Invalid range specifier", "rangeSpecifier");
+			if (from > to || from < 0)
+				throw new ArgumentOutOfRangeException ("from");
+			if (to < 0)
+				throw new ArgumentOutOfRangeException ("to");
+
+			string r = webHeaders ["Range"];
+			if (r == null)
+				r = rangeSpecifier + "=";
+			else
+				r += ",";
+
+			r = String.Format ("{0}{1}-{2}", r, from, to);
+			webHeaders.RemoveAndAdd ("Range", r);
+		}
+
 		
 		public override IAsyncResult BeginGetRequestStream (AsyncCallback callback, object state) 
 		{
@@ -879,6 +1002,7 @@ namespace System.Net
 			info.AddValue ("sendChunked", sendChunked);
 			info.AddValue ("timeout", timeout);
 			info.AddValue ("redirects", redirects);
+			info.AddValue ("host", host);
 		}
 		
 		void CheckRequestStarted () 
@@ -949,8 +1073,7 @@ namespace System.Net
 									WebExceptionStatus.ProtocolError);
 			}
 
-			hostChanged = (actualUri.Scheme != prev.Scheme || actualUri.Host != prev.Host ||
-					actualUri.Port != prev.Port);
+			hostChanged = (actualUri.Scheme != prev.Scheme || Host != prev.Authority);
 			return true;
 		}
 
@@ -996,7 +1119,7 @@ namespace System.Net
 				webHeaders.RemoveAndAdd (connectionHeader, "close");
 			}
 
-			webHeaders.SetInternal ("Host", actualUri.Authority);
+			webHeaders.SetInternal ("Host", Host);
 			if (cookieContainer != null) {
 				string cookieHeader = cookieContainer.GetCookieHeader (actualUri);
 				if (cookieHeader != "")
@@ -1062,15 +1185,10 @@ namespace System.Net
 			string query;
 			if (!ProxyQuery) {
 				query = actualUri.PathAndQuery;
-			} else if (actualUri.IsDefaultPort) {
-				query = String.Format ("{0}://{1}{2}",  actualUri.Scheme,
-									actualUri.Host,
-									actualUri.PathAndQuery);
 			} else {
-				query = String.Format ("{0}://{1}:{2}{3}", actualUri.Scheme,
-									   actualUri.Host,
-									   actualUri.Port,
-									   actualUri.PathAndQuery);
+				query = String.Format ("{0}://{1}{2}",  actualUri.Scheme,
+									Host,
+									actualUri.PathAndQuery);
 			}
 			
 			if (servicePoint.ProtocolVersion != null && servicePoint.ProtocolVersion < version) {

@@ -68,7 +68,13 @@ namespace Mono.Debugger.Soft
 			return vm;
 		}
 
-		public static IAsyncResult BeginLaunch (ProcessStartInfo info, AsyncCallback callback, LaunchOptions options = null) {
+		public static IAsyncResult BeginLaunch (ProcessStartInfo info, AsyncCallback callback)
+		{
+			return BeginLaunch (info, callback, null);
+		}
+
+		public static IAsyncResult BeginLaunch (ProcessStartInfo info, AsyncCallback callback, LaunchOptions options)
+		{
 			if (info == null)
 				throw new ArgumentNullException ("info");
 
@@ -116,11 +122,23 @@ namespace Mono.Debugger.Soft
 			return cb.EndInvoke (asyncResult);
 		}
 
-		public static VirtualMachine Launch (ProcessStartInfo info, LaunchOptions options = null) {
+		public static VirtualMachine Launch (ProcessStartInfo info)
+		{
+			return Launch (info, null);
+		}
+
+		public static VirtualMachine Launch (ProcessStartInfo info, LaunchOptions options)
+		{
 			return EndLaunch (BeginLaunch (info, null, options));
 		}
 
-		public static VirtualMachine Launch (string[] args, LaunchOptions options = null) {
+		public static VirtualMachine Launch (string[] args)
+		{
+			return Launch (args, null);
+		}
+
+		public static VirtualMachine Launch (string[] args, LaunchOptions options)
+		{
 			ProcessStartInfo pi = new ProcessStartInfo ("mono");
 			pi.Arguments = String.Join (" ", args);
 
@@ -155,7 +173,8 @@ namespace Mono.Debugger.Soft
 			}
 
 			if (con_sock != null) {
-				con_sock.Disconnect (false);
+				if (con_sock.Connected)
+					con_sock.Disconnect (false);
 				con_sock.Close ();
 			}
 
@@ -213,7 +232,13 @@ namespace Mono.Debugger.Soft
 			return cb.EndInvoke (asyncResult);
 		}
 
-		public static VirtualMachine Listen (IPEndPoint dbg_ep, IPEndPoint con_ep = null) { 
+		public static VirtualMachine Listen (IPEndPoint dbg_ep)
+		{
+			return Listen (dbg_ep, null);
+		}
+
+		public static VirtualMachine Listen (IPEndPoint dbg_ep, IPEndPoint con_ep)
+		{
 			return EndListen (BeginListen (dbg_ep, con_ep, null));
 		}
 

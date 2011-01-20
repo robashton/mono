@@ -22,12 +22,13 @@
 //
 //
 
+#if NET_4_0
+
 using System;
+using System.Collections.Concurrent;
 using System.Runtime.ConstrainedExecution;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
-
-#if NET_4_0 || BOOTSTRAP_NET_4_0
 
 namespace System.Threading
 {
@@ -41,9 +42,13 @@ namespace System.Threading
 		public int Users;
 	}
 
-	// Implement the ticket SpinLock algorithm described on http://locklessinc.com/articles/locks/
-	// This lock is usable on both endianness
-	// TODO: some 32 bits platform apparently doesn't support CAS with 64 bits value
+	/* Implement the ticket SpinLock algorithm described on http://locklessinc.com/articles/locks/
+	 * This lock is usable on both endianness.
+	 * All the try/finally patterns in this class and various extra gimmicks compared to the original
+	 * algorithm are here to avoid problems caused by asynchronous exceptions.
+	 */
+	[System.Diagnostics.DebuggerDisplay ("IsHeld = {IsHeld}")]
+	[System.Diagnostics.DebuggerTypeProxy ("System.Threading.SpinLock+SystemThreading_SpinLockDebugView")]
 	public struct SpinLock
 	{
 		TicketType ticket;
@@ -52,6 +57,8 @@ namespace System.Threading
 		readonly bool isThreadOwnerTrackingEnabled;
 
 		static Watch sw = Watch.StartNew ();
+
+		ConcurrentOrderedList<int> stallTickets;
 
 		public bool IsThreadOwnerTrackingEnabled {
 			get {
@@ -76,11 +83,12 @@ namespace System.Threading
 			}
 		}
 
-		public SpinLock (bool trackId)
+		public SpinLock (bool enableThreadOwnerTracking)
 		{
-			this.isThreadOwnerTrackingEnabled = trackId;
+			this.isThreadOwnerTrackingEnabled = enableThreadOwnerTracking;
 			this.threadWhoTookLock = 0;
 			this.ticket = new TicketType ();
+			this.stallTickets = null;
 		}
 
 		[MonoTODO ("Not safe against async exceptions")]
@@ -91,21 +99,30 @@ namespace System.Threading
 			if (isThreadOwnerTrackingEnabled && IsHeldByCurrentThread)
 				throw new LockRecursionException ();
 
-			/* The current ticket algorithm, even though it's a thing of beauty, doesn't make it easy to
-			 * hand back ticket that have been taken in the case of an asynchronous exception and naively
-			 * fixing it bloat a code that should be kept simple. A straightforward possibility is to wrap
-			 * the whole thing in a finally block but due to the while loop a number of bad things can
-			 * happen, thus for the moment the code is left as is in the spirit of "better breaking fast,
-			 * than later in a weird way".
-			 */
-			int slot = Interlocked.Increment (ref ticket.Users) - 1;
+			int slot = -1;
 
-			SpinWait wait = new SpinWait ();
-			while (slot != ticket.Value)
-				wait.SpinOnce ();
+			RuntimeHelpers.PrepareConstrainedRegions ();
+			try {
+				slot = Interlocked.Increment (ref ticket.Users) - 1;
 
-			lockTaken = true;
-			threadWhoTookLock = Thread.CurrentThread.ManagedThreadId;
+				SpinWait wait = new SpinWait ();
+				while (slot != ticket.Value) {
+					wait.SpinOnce ();
+
+					while (stallTickets != null && stallTickets.TryRemove (ticket.Value))
+						++ticket.Value;
+				}
+			} finally {
+				if (slot == ticket.Value) {
+					lockTaken = true;
+					threadWhoTookLock = Thread.CurrentThread.ManagedThreadId;
+				} else if (slot != -1) {
+					// We have been interrupted, initialize stallTickets
+					if (stallTickets == null)
+						Interlocked.CompareExchange (ref stallTickets, new ConcurrentOrderedList<int> (), null);
+					stallTickets.TryAdd (slot);
+				}
+			}
 		}
 
 		public void TryEnter (ref bool lockTaken)
@@ -118,19 +135,22 @@ namespace System.Threading
 			TryEnter ((int)timeout.TotalMilliseconds, ref lockTaken);
 		}
 
-		public void TryEnter (int milliSeconds, ref bool lockTaken)
+		public void TryEnter (int millisecondsTimeout, ref bool lockTaken)
 		{
-			if (milliSeconds < -1)
+			if (millisecondsTimeout < -1)
 				throw new ArgumentOutOfRangeException ("milliSeconds", "millisecondsTimeout is a negative number other than -1");
 			if (lockTaken)
 				throw new ArgumentException ("lockTaken", "lockTaken must be initialized to false");
 			if (isThreadOwnerTrackingEnabled && IsHeldByCurrentThread)
 				throw new LockRecursionException ();
 
-			long start = milliSeconds == -1 ? 0 : sw.ElapsedMilliseconds;
+			long start = millisecondsTimeout == -1 ? 0 : sw.ElapsedMilliseconds;
 			bool stop = false;
 
 			do {
+				while (stallTickets != null && stallTickets.TryRemove (ticket.Value))
+					++ticket.Value;
+
 				long u = ticket.Users;
 				long totalValue = (u << 32) | u;
 				long newTotalValue
@@ -146,15 +166,17 @@ namespace System.Threading
 						stop = true;
 					}
 				}
-	        } while (!stop && (milliSeconds == -1 || (sw.ElapsedMilliseconds - start) < milliSeconds));
+	        } while (!stop && (millisecondsTimeout == -1 || (sw.ElapsedMilliseconds - start) < millisecondsTimeout));
 		}
 
+		[ReliabilityContract (Consistency.WillNotCorruptState, Cer.Success)]
 		public void Exit ()
 		{
 			Exit (false);
 		}
 
-		public void Exit (bool flushReleaseWrites)
+		[ReliabilityContract (Consistency.WillNotCorruptState, Cer.Success)]
+		public void Exit (bool useMemoryBarrier)
 		{
 			RuntimeHelpers.PrepareConstrainedRegions ();
 			try {}
@@ -163,11 +185,12 @@ namespace System.Threading
 					throw new SynchronizationLockException ("Current thread is not the owner of this lock");
 
 				threadWhoTookLock = int.MinValue;
-				// Fast path
-				if (flushReleaseWrites)
-					Interlocked.Increment (ref ticket.Value);
-				else
-					ticket.Value++;
+				do {
+					if (useMemoryBarrier)
+						Interlocked.Increment (ref ticket.Value);
+					else
+						ticket.Value++;
+				} while (stallTickets != null && stallTickets.TryRemove (ticket.Value));
 			}
 		}
 	}

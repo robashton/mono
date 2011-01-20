@@ -162,13 +162,13 @@ namespace Mono.CSharp
 		static void Usage ()
 		{
 			Console.WriteLine (
-				"Mono C# compiler, Copyright 2001 - 2008 Novell, Inc.\n" +
+				"Mono C# compiler, Copyright 2001 - 2011 Novell, Inc.\n" +
 				"mcs [options] source-files\n" +
 				"   --about              About the Mono C# compiler\n" +
 				"   -addmodule:M1[,Mn]   Adds the module to the generated assembly\n" + 
 				"   -checked[+|-]        Sets default aritmetic overflow context\n" +
-				"   -codepage:ID         Sets code page to the one in ID (number, utf8, reset)\n" +
 				"   -clscheck[+|-]       Disables CLS Compliance verifications\n" +
+				"   -codepage:ID         Sets code page to the one in ID (number, utf8, reset)\n" +
 				"   -define:S1[;S2]      Defines one or more conditional symbols (short: -d)\n" +
 				"   -debug[+|-], -g      Generate debugging information\n" + 
 				"   -delaysign[+|-]      Only insert the public key into the assembly (no signing)\n" +
@@ -184,14 +184,14 @@ namespace Mono.CSharp
 				"   -nowarn:W1[,Wn]      Suppress one or more compiler warnings\n" + 
 				"   -optimize[+|-]       Enables advanced compiler optimizations (short: -o)\n" + 
 				"   -out:FILE            Specifies output assembly name\n" +
-#if !SMCS_SOURCE
 				"   -pkg:P1[,Pn]         References packages P1..Pn\n" + 
-#endif
 				"   -platform:ARCH       Specifies the target platform of the output assembly\n" +
 				"                        ARCH can be one of: anycpu, x86, x64 or itanium\n" +
 				"   -recurse:SPEC        Recursively compiles files according to SPEC pattern\n" + 
 				"   -reference:A1[,An]   Imports metadata from the specified assembly (short: -r)\n" +
-				"   -reference:ALIAS=A   Imports metadata using specified extern alias (short: -r)\n" +				
+				"   -reference:ALIAS=A   Imports metadata using specified extern alias (short: -r)\n" +
+				"   -sdk:VERSION         Specifies SDK version of referenced assemlies\n" +
+				"                        VERSION can be one of: 2 (default), 4\n" +
 				"   -target:KIND         Specifies the format of the output assembly (short: -t)\n" +
 				"                        KIND can be one of: exe, winexe, library, module\n" +
 				"   -unsafe[+|-]         Allows to compile code which uses unsafe keyword\n" +
@@ -217,7 +217,7 @@ namespace Mono.CSharp
 		static void About ()
 		{
 			Console.WriteLine (
-				"The Mono C# compiler is Copyright 2001-2008, Novell, Inc.\n\n" +
+				"The Mono C# compiler is Copyright 2001-2011, Novell, Inc.\n\n" +
 				"The compiler source code is released under the terms of the \n"+
 				"MIT X11 or GNU GPL licenses\n\n" +
 
@@ -782,7 +782,6 @@ namespace Mono.CSharp
 			return false;
 		}
 
-#if !SMCS_SOURCE
 		public static string GetPackageFlags (string packages, bool fatal, Report report)
 		{
 			ProcessStartInfo pi = new ProcessStartInfo ();
@@ -819,7 +818,6 @@ namespace Mono.CSharp
 
 			return pkgout;
 		}
-#endif
 
 		//
 		// This parses the -arg and /arg options to the compiler, even if the strings
@@ -921,7 +919,7 @@ namespace Mono.CSharp
 				//
 				Console.WriteLine ("To file bug reports, please visit: http://www.mono-project.com/Bugs");
 				return true;
-#if !SMCS_SOURCE
+
 			case "/pkg": {
 				string packages;
 
@@ -940,13 +938,13 @@ namespace Mono.CSharp
 				
 				return true;
 			}
-#endif
+
 			case "/linkres":
 			case "/linkresource":
 			case "/res":
 			case "/resource":
 				AssemblyResource res = null;			
-				string[] s = value.Split (argument_value_separator);
+				string[] s = value.Split (argument_value_separator, StringSplitOptions.RemoveEmptyEntries);
 				switch (s.Length) {
 				case 1:
 					if (s[0].Length == 0)
@@ -1189,6 +1187,26 @@ namespace Mono.CSharp
 				default:
 					Report.Error (1672, "Invalid platform type for -platform. Valid options are `anycpu', `x86', `x64' or `itanium'");
 					break;
+				}
+
+				return true;
+
+			case "/sdk":
+				if (value.Length == 0) {
+					Error_RequiresArgument (option);
+					break;
+				}
+
+				switch (value.ToLowerInvariant ()) {
+					case "2":
+						RootContext.SdkVersion = SdkVersion.v2;
+						break;
+					case "4":
+						RootContext.SdkVersion = SdkVersion.v4;
+						break;
+					default:
+						Report.Error (-26, "Invalid sdk version name");
+						break;
 				}
 
 				return true;
@@ -1486,7 +1504,7 @@ namespace Mono.CSharp
 
 			ShowTime ("Initializing predefined types");
 
-			if (!assembly.Create (loader.Domain))
+			if (!assembly.Create (loader))
 				return false;
 
 			// System.Object was not loaded, use compiled assembly as corlib

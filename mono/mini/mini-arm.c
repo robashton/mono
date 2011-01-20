@@ -39,13 +39,24 @@ static CRITICAL_SECTION mini_arch_mutex;
 static int v5_supported = 0;
 static int v7_supported = 0;
 static int thumb_supported = 0;
+/*
+ * Whenever to use the ARM EABI
+ */
+static int eabi_supported = 0;
 
+/*
+ * Whenever we are on arm/darwin aka the iphone.
+ */
+static int darwin = 0;
 /* 
  * Whenever to use the iphone ABI extensions:
  * http://developer.apple.com/library/ios/documentation/Xcode/Conceptual/iPhoneOSABIReference/index.html
  * Basically, r7 is used as a frame pointer and it should point to the saved r7 + lr.
+ * This is required for debugging/profiling tools to work, but it has some overhead so it should
+ * only be turned on in debug builds.
  */
 static int iphone_abi = 0;
+static int i8_align;
 
 /*
  * The code generated for sequence points reads from this location, which is
@@ -450,6 +461,14 @@ mono_arch_get_this_arg_from_call (mgreg_t *regs, guint8 *code)
 void
 mono_arch_cpu_init (void)
 {
+#if defined(__ARM_EABI__)
+	eabi_supported = TRUE;
+#endif
+#if defined(__APPLE__) && defined(MONO_CROSS_COMPILE)
+		i8_align = 4;
+#else
+		i8_align = __alignof__ (gint64);
+#endif
 }
 
 /*
@@ -466,6 +485,7 @@ mono_arch_init (void)
 
 	mono_aot_register_jit_icall ("mono_arm_throw_exception", mono_arm_throw_exception);
 	mono_aot_register_jit_icall ("mono_arm_throw_exception_by_token", mono_arm_throw_exception_by_token);
+	mono_aot_register_jit_icall ("mono_arm_resume_unwind", mono_arm_resume_unwind);
 }
 
 /*
@@ -494,6 +514,7 @@ mono_arch_cpu_optimizazions (guint32 *exclude_mask)
 #if __APPLE__
 	thumb_supported = TRUE;
 	v5_supported = TRUE;
+	darwin = TRUE;
 	iphone_abi = TRUE;
 #else
 	char buf [512];
@@ -611,7 +632,7 @@ mono_arch_get_global_int_regs (MonoCompile *cfg)
 	regs = g_list_prepend (regs, GUINT_TO_POINTER (ARMREG_V1));
 	regs = g_list_prepend (regs, GUINT_TO_POINTER (ARMREG_V2));
 	regs = g_list_prepend (regs, GUINT_TO_POINTER (ARMREG_V3));
-	if (iphone_abi)
+	if (darwin)
 		/* V4=R7 is used as a frame pointer, but V7=R10 is preserved */
 		regs = g_list_prepend (regs, GUINT_TO_POINTER (ARMREG_V7));
 	else
@@ -728,17 +749,12 @@ add_general (guint *gr, guint *stack_size, ArgInfo *ainfo, gboolean simple)
 			ainfo->reg = *gr;
 		}
 	} else {
-#if defined(__APPLE__) && defined(MONO_CROSS_COMPILE)
-		int i8_align = 4;
-#else
-		int i8_align = __alignof__ (gint64);
-#endif
+		gboolean split;
 
-#if __ARM_EABI__
-		gboolean split = i8_align == 4;
-#else
-		gboolean split = TRUE;
-#endif
+		if (eabi_supported)
+			split = i8_align == 4;
+		else
+			split = TRUE;
 		
 		if (*gr == ARMREG_R3 && split) {
 			/* first word in r3 and the second on the stack */
@@ -747,22 +763,22 @@ add_general (guint *gr, guint *stack_size, ArgInfo *ainfo, gboolean simple)
 			ainfo->storage = RegTypeBaseGen;
 			*stack_size += 4;
 		} else if (*gr >= ARMREG_R3) {
-#ifdef __ARM_EABI__
-			/* darwin aligns longs to 4 byte only */
-			if (i8_align == 8) {
-				*stack_size += 7;
-				*stack_size &= ~7;
+			if (eabi_supported) {
+				/* darwin aligns longs to 4 byte only */
+				if (i8_align == 8) {
+					*stack_size += 7;
+					*stack_size &= ~7;
+				}
 			}
-#endif
 			ainfo->offset = *stack_size;
 			ainfo->reg = ARMREG_SP; /* in the caller */
 			ainfo->storage = RegTypeBase;
 			*stack_size += 8;
 		} else {
-#ifdef __ARM_EABI__
-			if (i8_align == 8 && ((*gr) & 1))
-				(*gr) ++;
-#endif
+			if (eabi_supported) {
+				if (i8_align == 8 && ((*gr) & 1))
+					(*gr) ++;
+			}
 			ainfo->storage = RegTypeIRegPair;
 			ainfo->reg = *gr;
 		}
@@ -916,10 +932,10 @@ get_call_info (MonoGenericSharingContext *gsctx, MonoMemPool *mp, MonoMethodSign
 			nwords = (align_size + sizeof (gpointer) -1 ) / sizeof (gpointer);
 			cinfo->args [n].storage = RegTypeStructByVal;
 			/* FIXME: align stack_size if needed */
-#ifdef __ARM_EABI__
-			if (align >= 8 && (gr & 1))
-				gr ++;
-#endif
+			if (eabi_supported) {
+				if (align >= 8 && (gr & 1))
+					gr ++;
+			}
 			if (gr > ARMREG_R3) {
 				cinfo->args [n].size = 0;
 				cinfo->args [n].vtsize = nwords;
@@ -1428,7 +1444,11 @@ mono_arch_get_llvm_call_info (MonoCompile *cfg, MonoMethodSignature *sig)
 	 * - we only pass/receive them in registers in some cases, and only 
 	 *   in 1 or 2 integer registers.
 	 */
-	if (cinfo->ret.storage != RegTypeGeneral && cinfo->ret.storage != RegTypeNone && cinfo->ret.storage != RegTypeFP && cinfo->ret.storage != RegTypeIRegPair) {
+	if (cinfo->vtype_retaddr) {
+		/* Vtype returned using a hidden argument */
+		linfo->ret.storage = LLVMArgVtypeRetAddr;
+		linfo->vret_arg_index = cinfo->vret_arg_index;
+	} else if (cinfo->ret.storage != RegTypeGeneral && cinfo->ret.storage != RegTypeNone && cinfo->ret.storage != RegTypeFP && cinfo->ret.storage != RegTypeIRegPair) {
 		cfg->exception_message = g_strdup ("unknown ret conv");
 		cfg->disable_llvm = TRUE;
 		return linfo;
@@ -1444,6 +1464,20 @@ mono_arch_get_llvm_call_info (MonoCompile *cfg, MonoMethodSignature *sig)
 		case RegTypeIRegPair:
 		case RegTypeBase:
 			linfo->args [i].storage = LLVMArgInIReg;
+			break;
+		case RegTypeStructByVal:
+			// FIXME: Passing entirely on the stack or split reg/stack
+			if (ainfo->vtsize == 0 && ainfo->size <= 2) {
+				linfo->args [i].storage = LLVMArgVtypeInReg;
+				linfo->args [i].pair_storage [0] = LLVMArgInIReg;
+				if (ainfo->size == 2)
+					linfo->args [i].pair_storage [1] = LLVMArgInIReg;
+				else
+					linfo->args [i].pair_storage [1] = LLVMArgNone;
+			} else {
+				cfg->exception_message = g_strdup_printf ("vtype-by-val on stack");
+				cfg->disable_llvm = TRUE;
+			}
 			break;
 		default:
 			cfg->exception_message = g_strdup_printf ("ainfo->storage (%d)", ainfo->storage);
@@ -1868,7 +1902,7 @@ mono_arch_start_dyn_call (MonoDynCallInfo *info, gpointer **args, guint8 *ret, g
 {
 	ArchDynCallInfo *dinfo = (ArchDynCallInfo*)info;
 	DynCallArgs *p = (DynCallArgs*)buf;
-	int arg_index, greg, i, j;
+	int arg_index, greg, i, j, pindex;
 	MonoMethodSignature *sig = dinfo->sig;
 
 	g_assert (buf_len >= sizeof (DynCallArgs));
@@ -1878,14 +1912,18 @@ mono_arch_start_dyn_call (MonoDynCallInfo *info, gpointer **args, guint8 *ret, g
 
 	arg_index = 0;
 	greg = 0;
+	pindex = 0;
+
+	if (sig->hasthis || dinfo->cinfo->vret_arg_index == 1) {
+		p->regs [greg ++] = (mgreg_t)*(args [arg_index ++]);
+		if (!sig->hasthis)
+			pindex = 1;
+	}
 
 	if (dinfo->cinfo->vtype_retaddr)
 		p->regs [greg ++] = (mgreg_t)ret;
 
-	if (sig->hasthis)
-		p->regs [greg ++] = (mgreg_t)*(args [arg_index ++]);
-
-	for (i = 0; i < sig->param_count; i++) {
+	for (i = pindex; i < sig->param_count; i++) {
 		MonoType *t = mono_type_get_underlying_type (sig->params [i]);
 		gpointer *arg = args [arg_index ++];
 		ArgInfo *ainfo = &dinfo->cinfo->args [i + sig->hasthis];
@@ -3699,7 +3737,7 @@ mono_arch_output_basic_block (MonoCompile *cfg, MonoBasicBlock *bb)
 			break;
 		case OP_CHECK_THIS:
 			/* ensure ins->sreg1 is not NULL */
-			ARM_LDR_IMM (code, ARMREG_LR, ins->sreg1, 0);
+			ARM_LDRB_IMM (code, ARMREG_LR, ins->sreg1, 0);
 			break;
 		case OP_ARGLIST: {
 			g_assert (cfg->sig_cookie < 128);
@@ -3781,7 +3819,7 @@ mono_arch_output_basic_block (MonoCompile *cfg, MonoBasicBlock *bb)
 				ARM_STR_REG_REG (code, ARMREG_LR, ARMREG_SP, ins->dreg);
 				arm_patch (branch_to_cond, code);
 				/* decrement by 4 and set flags */
-				ARM_SUBS_REG_IMM8 (code, ins->dreg, ins->dreg, 4);
+				ARM_SUBS_REG_IMM8 (code, ins->dreg, ins->dreg, sizeof (mgreg_t));
 				ARM_B_COND (code, ARMCOND_GE, 0);
 				arm_patch (code - 4, start_loop);
 			}
@@ -3806,13 +3844,13 @@ mono_arch_output_basic_block (MonoCompile *cfg, MonoBasicBlock *bb)
 			/* Set stack slots using R0 as scratch reg */
 			/* MONO_ARCH_DYN_CALL_PARAM_AREA gives the size of stack space available */
 			for (i = 0; i < DYN_CALL_STACK_ARGS; ++i) {
-				ARM_LDR_IMM (code, ARMREG_R0, ARMREG_LR, (PARAM_REGS + i) * sizeof (gpointer));
-				ARM_STR_IMM (code, ARMREG_R0, ARMREG_SP, i * sizeof (gpointer));
+				ARM_LDR_IMM (code, ARMREG_R0, ARMREG_LR, (PARAM_REGS + i) * sizeof (mgreg_t));
+				ARM_STR_IMM (code, ARMREG_R0, ARMREG_SP, i * sizeof (mgreg_t));
 			}
 
 			/* Set argument registers */
 			for (i = 0; i < PARAM_REGS; ++i)
-				ARM_LDR_IMM (code, i, ARMREG_LR, i * sizeof (gpointer));
+				ARM_LDR_IMM (code, i, ARMREG_LR, i * sizeof (mgreg_t));
 
 			/* Make the call */
 			ARM_MOV_REG_REG (code, ARMREG_LR, ARMREG_PC);
@@ -4578,6 +4616,7 @@ mono_arch_emit_prolog (MonoCompile *cfg)
 			 * the frame, so we keep using our own frame pointer.
 			 * FIXME: Optimize this.
 			 */
+			g_assert (darwin);
 			ARM_PUSH (code, (1 << ARMREG_R7) | (1 << ARMREG_LR));
 			ARM_MOV_REG_REG (code, ARMREG_R7, ARMREG_SP);
 			prev_sp_offset += 8; /* r7 and lr */
@@ -5009,7 +5048,7 @@ mono_arch_emit_epilog (MonoCompile *cfg)
 	if (method->save_lmf) {
 		int lmf_offset, reg, sp_adj, regmask;
 		/* all but r0-r3, sp and pc */
-		pos += sizeof (MonoLMF) - (4 * 10);
+		pos += sizeof (MonoLMF) - (MONO_ARM_NUM_SAVED_REGS * sizeof (mgreg_t));
 		lmf_offset = pos;
 		/* r2 contains the pointer to the current LMF */
 		code = emit_big_add (code, ARMREG_R2, cfg->frame_reg, cfg->stack_usage - lmf_offset);
@@ -5020,7 +5059,7 @@ mono_arch_emit_epilog (MonoCompile *cfg)
 		/* *(lmf_addr) = previous_lmf */
 		ARM_STR_IMM (code, ARMREG_IP, ARMREG_LR, G_STRUCT_OFFSET (MonoLMF, previous_lmf));
 		/* This points to r4 inside MonoLMF->iregs */
-		sp_adj = (sizeof (MonoLMF) - 10 * sizeof (gulong));
+		sp_adj = (sizeof (MonoLMF) - MONO_ARM_NUM_SAVED_REGS * sizeof (mgreg_t));
 		reg = ARMREG_R4;
 		regmask = 0x9ff0; /* restore lr to pc */
 		/* Skip caller saved registers not used by the method */
@@ -5539,6 +5578,18 @@ mono_arch_context_get_int_reg (MonoContext *ctx, int reg)
 }
 
 /*
+ * mono_arch_get_trampolines:
+ *
+ *   Return a list of MonoTrampInfo structures describing arch specific trampolines
+ * for AOT.
+ */
+GSList *
+mono_arch_get_trampolines (gboolean aot)
+{
+	return mono_arm_get_exception_trampolines (aot);
+}
+
+/*
  * mono_arch_set_breakpoint:
  *
  *   Set a breakpoint at the native code corresponding to JI at NATIVE_OFFSET.
@@ -5752,3 +5803,26 @@ mono_arch_get_seq_point_info (MonoDomain *domain, guint8 *code)
 
 	return info;
 }
+
+/*
+ * mono_arch_set_target:
+ *
+ *   Set the target architecture the JIT backend should generate code for, in the form
+ * of a GNU target triplet. Only used in AOT mode.
+ */
+void
+mono_arch_set_target (char *mtriple)
+{
+	/* The GNU target triple format is not very well documented */
+	if (strstr (mtriple, "armv7"))
+		v7_supported = TRUE;
+	if (strstr (mtriple, "darwin")) {
+		v5_supported = TRUE;
+		thumb_supported = TRUE;
+		darwin = TRUE;
+		iphone_abi = TRUE;
+	}
+	if (strstr (mtriple, "gnueabi"))
+		eabi_supported = TRUE;
+}
+

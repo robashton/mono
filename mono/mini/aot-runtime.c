@@ -51,6 +51,7 @@
 #include <mono/metadata/gc-internal.h>
 #include <mono/metadata/monitor.h>
 #include <mono/metadata/threads-types.h>
+#include <mono/metadata/mono-endian.h>
 #include <mono/utils/mono-logger-internal.h>
 #include <mono/utils/mono-mmap.h>
 #include "mono/utils/mono-compiler.h"
@@ -112,9 +113,10 @@ typedef struct MonoAotModule {
 	guint32 *extra_method_table;
 	guint32 *extra_method_info_offsets;
 	guint8 *unwind_info;
+	guint8 *thumb_end;
 
-	/* Points to the GNU .eh_frame_hdr section, if it exists */
-	guint8 *eh_frame_hdr;
+	/* Points to the mono EH data created by LLVM */
+	guint8 *mono_eh_frame;
 
 	/* Points to the trampolines */
 	guint8 *trampolines [MONO_AOT_TRAMP_NUM];
@@ -583,16 +585,37 @@ decode_method_ref_with_target (MonoAotModule *module, MethodRef *ref, MonoMethod
 			MonoMethod *orig_method;
 			int subtype = decode_value (p, &p);
 
-			if (subtype == MONO_AOT_WRAPPER_MONO_ENTER)
-				desc = mono_method_desc_new ("Monitor:Enter", FALSE);
-			else if (subtype == MONO_AOT_WRAPPER_MONO_EXIT)
-				desc = mono_method_desc_new ("Monitor:Exit", FALSE);
-			else
-				g_assert_not_reached ();
-			orig_method = mono_method_desc_search_in_class (desc, mono_defaults.monitor_class);
-			g_assert (orig_method);
-			mono_method_desc_free (desc);
-			ref->method = mono_monitor_get_fast_path (orig_method);
+			if (subtype == MONO_AOT_WRAPPER_PTR_TO_STRUCTURE || subtype == MONO_AOT_WRAPPER_STRUCTURE_TO_PTR) {
+				MonoClass *klass = decode_klass_ref (module, p, &p);
+				
+				if (!klass)
+					return FALSE;
+
+				g_assert (target);
+				if (klass != target->klass)
+					return FALSE;
+
+				if (subtype == MONO_AOT_WRAPPER_PTR_TO_STRUCTURE) {
+					if (strcmp (target->name, "PtrToStructure"))
+						return FALSE;
+					ref->method = mono_marshal_get_ptr_to_struct (klass);
+				} else {
+					if (strcmp (target->name, "StructureToPtr"))
+						return FALSE;
+					ref->method = mono_marshal_get_struct_to_ptr (klass);
+				}
+			} else {
+				if (subtype == MONO_AOT_WRAPPER_MONO_ENTER)
+					desc = mono_method_desc_new ("Monitor:Enter", FALSE);
+				else if (subtype == MONO_AOT_WRAPPER_MONO_EXIT)
+					desc = mono_method_desc_new ("Monitor:Exit", FALSE);
+				else
+					g_assert_not_reached ();
+				orig_method = mono_method_desc_search_in_class (desc, mono_defaults.monitor_class);
+				g_assert (orig_method);
+				mono_method_desc_free (desc);
+				ref->method = mono_monitor_get_fast_path (orig_method);
+			}
 			break;
 		}
 		case MONO_WRAPPER_RUNTIME_INVOKE: {
@@ -615,6 +638,20 @@ decode_method_ref_with_target (MonoAotModule *module, MethodRef *ref, MonoMethod
 			} else {
 				g_assert_not_reached ();
 			}
+			break;
+		}
+		case MONO_WRAPPER_MANAGED_TO_NATIVE: {
+			MonoMethod *m = decode_resolve_method_ref (module, p, &p);
+
+			if (!m)
+				return FALSE;
+
+			/* This should only happen when looking for an extra method */
+			g_assert (target);
+			if (mono_marshal_method_from_wrapper (target) == m)
+				ref->method = target;
+			else
+				return FALSE;
 			break;
 		}
 		default:
@@ -927,24 +964,68 @@ find_symbol (MonoDl *module, gpointer *globals, const char *name, gpointer *valu
 	}
 }
 
-#if defined(HAVE_DL_ITERATE_PHDR) && defined(PT_GNU_EH_FRAME)
-static int
-dl_callback (struct dl_phdr_info *info, size_t size, void *data)
+static gboolean
+check_usable (MonoAssembly *assembly, MonoAotFileInfo *info, char **out_msg)
 {
-	int j;
-	MonoAotModule *amodule = data;
+	char *build_info;
+	char *msg = NULL;
+	gboolean usable = TRUE;
+	gboolean full_aot;
+	guint8 *blob;
 
-	if (!strcmp (amodule->aot_name, info->dlpi_name)) {
-		for (j = 0; j < info->dlpi_phnum; j++) {
-			if (info->dlpi_phdr [j].p_type == PT_GNU_EH_FRAME)
-				amodule->eh_frame_hdr = (guint8*)(info->dlpi_addr + info->dlpi_phdr [j].p_vaddr);
-		}
-		return 1;
-	} else {
-		return 0;
+	if (strcmp (assembly->image->guid, info->assembly_guid)) {
+		msg = g_strdup_printf ("doesn't match assembly");
+		usable = FALSE;
 	}
-}
+
+	build_info = mono_get_runtime_build_info ();
+	if (strlen (info->runtime_version) > 0 && strcmp (info->runtime_version, build_info)) {
+		msg = g_strdup_printf ("compiled against runtime version '%s' while this runtime has version '%s'", info->runtime_version, build_info);
+		usable = FALSE;
+	}
+	g_free (build_info);
+
+	full_aot = info->flags & MONO_AOT_FILE_FLAG_FULL_AOT;
+
+	if (mono_aot_only && !full_aot) {
+		msg = g_strdup_printf ("not compiled with --aot=full");
+		usable = FALSE;
+	}
+	if (!mono_aot_only && full_aot) {
+		msg = g_strdup_printf ("compiled with --aot=full");
+		usable = FALSE;
+	}
+#ifdef TARGET_ARM
+	/* mono_arch_find_imt_method () requires this */
+	if ((info->flags & MONO_AOT_FILE_FLAG_WITH_LLVM) && !mono_use_llvm) {
+		msg = g_strdup_printf ("compiled against LLVM");
+		usable = FALSE;
+	}
+	if (!(info->flags & MONO_AOT_FILE_FLAG_WITH_LLVM) && mono_use_llvm) {
+		msg = g_strdup_printf ("not compiled against LLVM");
+		usable = FALSE;
+	}
 #endif
+	if (mini_get_debug_options ()->mdb_optimizations && !(info->flags & MONO_AOT_FILE_FLAG_DEBUG) && !full_aot) {
+		msg = g_strdup_printf ("not compiled for debugging");
+		usable = FALSE;
+	}
+
+	blob = info->blob;
+
+	if (info->gc_name_index != -1) {
+		char *gc_name = (char*)&blob [info->gc_name_index];
+		const char *current_gc_name = mono_gc_get_gc_name ();
+
+		if (strcmp (current_gc_name, gc_name) != 0) {
+			msg = g_strdup_printf ("compiled against GC %s, while the current runtime uses GC %s.\n", gc_name, current_gc_name);
+			usable = FALSE;
+		}
+	}
+
+	*out_msg = msg;
+	return usable;
+}
 
 static void
 load_aot_module (MonoAssembly *assembly, gpointer user_data)
@@ -953,16 +1034,13 @@ load_aot_module (MonoAssembly *assembly, gpointer user_data)
 	MonoAotModule *amodule;
 	MonoDl *sofile;
 	gboolean usable = TRUE;
-	char *saved_guid = NULL;
-	char *aot_version = NULL;
-	char *runtime_version, *build_info;
-	char *opt_flags = NULL;
-	gpointer *globals;
-	gboolean full_aot = FALSE;
-	MonoAotFileInfo *file_info = NULL;
-	int i;
-	gpointer *got_addr;
+	char *version_symbol = NULL;
+	char *msg = NULL;
+	gpointer *globals = NULL;
+	MonoAotFileInfo *info = NULL;
+	int i, version;
 	guint8 *blob;
+	gboolean do_load_image = TRUE;
 
 	if (mono_compile_aot)
 		return;
@@ -982,16 +1060,17 @@ load_aot_module (MonoAssembly *assembly, gpointer user_data)
 
 	mono_aot_lock ();
 	if (static_aot_modules)
-		globals = g_hash_table_lookup (static_aot_modules, assembly->aname.name);
+		info = g_hash_table_lookup (static_aot_modules, assembly->aname.name);
 	else
-		globals = NULL;
+		info = NULL;
 	mono_aot_unlock ();
 
-	if (globals) {
+	if (info) {
 		/* Statically linked AOT module */
 		sofile = NULL;
 		aot_name = g_strdup_printf ("%s", assembly->aname.name);
 		mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_AOT, "Found statically linked AOT module '%s'.\n", aot_name);
+		globals = info->globals;
 	} else {
 		if (use_aot_cache)
 			sofile = load_aot_module_from_cache (assembly, &aot_name);
@@ -1017,75 +1096,34 @@ load_aot_module (MonoAssembly *assembly, gpointer user_data)
 		return;
 	}
 
-	find_symbol (sofile, globals, "mono_assembly_guid", (gpointer *) &saved_guid);
-	find_symbol (sofile, globals, "mono_aot_version", (gpointer *) &aot_version);
-	find_symbol (sofile, globals, "mono_aot_opt_flags", (gpointer *)&opt_flags);
-	find_symbol (sofile, globals, "mono_runtime_version", (gpointer *)&runtime_version);
-	find_symbol (sofile, globals, "mono_aot_got_addr", (gpointer *)&got_addr);
+	if (!info) {
+		find_symbol (sofile, globals, "mono_aot_version", (gpointer *) &version_symbol);
+		find_symbol (sofile, globals, "mono_aot_file_info", (gpointer*)&info);
+	}
 
-	if (!aot_version || strcmp (aot_version, MONO_AOT_FILE_VERSION)) {
-		mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_AOT, "AOT module %s has wrong file format version (expected %s got %s)\n", aot_name, MONO_AOT_FILE_VERSION, aot_version);
+	if (version_symbol) {
+		/* Old file format */
+		version = atoi (version_symbol);
+	} else {
+		g_assert (info);
+		version = info->version;
+	}
+
+	if (version != MONO_AOT_FILE_VERSION) {
+		msg = g_strdup_printf ("wrong file format version (expected %d got %d)", MONO_AOT_FILE_VERSION, version);
 		usable = FALSE;
-	}
-	else {
-		if (!saved_guid || strcmp (assembly->image->guid, saved_guid)) {
-			mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_AOT, "AOT module %s is out of date.\n", aot_name);
-			usable = FALSE;
-		}
-	}
-
-	build_info = mono_get_runtime_build_info ();
-	if (!runtime_version || ((strlen (runtime_version) > 0 && strcmp (runtime_version, build_info)))) {
-		mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_AOT, "AOT module %s is compiled against runtime version '%s' while this runtime has version '%s'.\n", aot_name, runtime_version, build_info);
-		usable = FALSE;
-	}
-	g_free (build_info);
-
-	find_symbol (sofile, globals, "mono_aot_file_info", (gpointer*)&file_info);
-	g_assert (file_info);
-
-	full_aot = ((MonoAotFileInfo*)file_info)->flags & MONO_AOT_FILE_FLAG_FULL_AOT;
-
-	if (mono_aot_only && !full_aot) {
-		fprintf (stderr, "Can't use AOT image '%s' in aot-only mode because it is not compiled with --aot=full.\n", aot_name);
-		exit (1);
-	}
-	if (!mono_aot_only && full_aot) {
-		mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_AOT, "AOT module %s is compiled with --aot=full.\n", aot_name);
-		usable = FALSE;
-	}
-
-	/* This is no longer needed, LLVM and non-LLVM runtimes should be compatible.
-	if ((((MonoAotFileInfo*)file_info)->flags & MONO_AOT_FILE_FLAG_WITH_LLVM) && !mono_use_llvm) {
-		mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_AOT, "AOT module %s is compiled with LLVM.\n", aot_name);
-		usable = FALSE;
-	}
-	*/
-
-	if (mini_get_debug_options ()->mdb_optimizations && !(file_info->flags & MONO_AOT_FILE_FLAG_DEBUG) && !full_aot) {
-		mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_AOT, "AOT module %s is not compiled for debugging.\n", aot_name);
-		usable = FALSE;
-	}
-
-	find_symbol (sofile, globals, "blob", (gpointer*)&blob);
-
-	if (usable && ((MonoAotFileInfo*)file_info)->gc_name_index != -1) {
-		char *gc_name = (char*)&blob [((MonoAotFileInfo*)file_info)->gc_name_index];
-		const char *current_gc_name = mono_gc_get_gc_name ();
-
-		if (strcmp (current_gc_name, gc_name) != 0) {
-			mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_AOT, "AOT module %s is compiled against GC %s, while the current runtime uses GC %s.\n", aot_name, gc_name, current_gc_name);
-			usable = FALSE;
-		}
+	} else {
+		usable = check_usable (assembly, info, &msg);
 	}
 
 	if (!usable) {
 		if (mono_aot_only) {
-			fprintf (stderr, "Failed to load AOT module '%s' while running in aot-only mode.\n", aot_name);
+			fprintf (stderr, "Failed to load AOT module '%s' while running in aot-only mode: %s.\n", aot_name, msg);
 			exit (1);
 		} else {
-			mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_AOT, "AOT module %s is unusable.\n", aot_name);
+			mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_AOT, "AOT module %s is unusable: %s.\n", aot_name, msg);
 		}
+		g_free (msg);
 		g_free (aot_name);
 		if (sofile)
 			mono_dl_close (sofile);
@@ -1093,13 +1131,19 @@ load_aot_module (MonoAssembly *assembly, gpointer user_data)
 		return;
 	}
 
+	/* Sanity check */
+	g_assert (info->double_align == __alignof__ (double));
+	g_assert (info->long_align == __alignof__ (gint64));
+
+	blob = info->blob;
+
 	amodule = g_new0 (MonoAotModule, 1);
 	amodule->aot_name = aot_name;
 	amodule->assembly = assembly;
 
-	memcpy (&amodule->info, file_info, sizeof (*file_info));
+	memcpy (&amodule->info, info, sizeof (*info));
 
-	amodule->got = *got_addr;
+	amodule->got = amodule->info.got;
 	amodule->got [0] = assembly->image;
 	amodule->globals = globals;
 	amodule->sofile = sofile;
@@ -1111,7 +1155,7 @@ load_aot_module (MonoAssembly *assembly, gpointer user_data)
 		guint32 table_len, i;
 		char *table = NULL;
 
-		find_symbol (sofile, globals, "mono_image_table", (gpointer *)&table);
+		table = info->image_table;
 		g_assert (table);
 
 		table_len = *(guint32*)table;
@@ -1147,27 +1191,30 @@ load_aot_module (MonoAssembly *assembly, gpointer user_data)
 		}
 	}
 
-	/* Read method and method_info tables */
-	find_symbol (sofile, globals, "code_offsets", (gpointer*)&amodule->code_offsets);
-	find_symbol (sofile, globals, "methods", (gpointer*)&amodule->code);
-	find_symbol (sofile, globals, "methods_end", (gpointer*)&amodule->code_end);
-	find_symbol (sofile, globals, "method_info_offsets", (gpointer*)&amodule->method_info_offsets);
-	find_symbol (sofile, globals, "ex_info_offsets", (gpointer*)&amodule->ex_info_offsets);
-	find_symbol (sofile, globals, "class_info_offsets", (gpointer*)&amodule->class_info_offsets);
-	find_symbol (sofile, globals, "class_name_table", (gpointer *)&amodule->class_name_table);
-	find_symbol (sofile, globals, "extra_method_table", (gpointer *)&amodule->extra_method_table);
-	find_symbol (sofile, globals, "extra_method_info_offsets", (gpointer *)&amodule->extra_method_info_offsets);
-	find_symbol (sofile, globals, "got_info_offsets", (gpointer*)&amodule->got_info_offsets);
-	find_symbol (sofile, globals, "specific_trampolines", (gpointer*)&(amodule->trampolines [MONO_AOT_TRAMP_SPECIFIC]));
-	find_symbol (sofile, globals, "static_rgctx_trampolines", (gpointer*)&(amodule->trampolines [MONO_AOT_TRAMP_STATIC_RGCTX]));
-	find_symbol (sofile, globals, "imt_thunks", (gpointer*)&(amodule->trampolines [MONO_AOT_TRAMP_IMT_THUNK]));
-	find_symbol (sofile, globals, "unwind_info", (gpointer)&amodule->unwind_info);
-	find_symbol (sofile, globals, "mem_end", (gpointer*)&amodule->mem_end);
-
+	amodule->code_offsets = info->code_offsets;
+	amodule->code = info->methods;
+#ifdef TARGET_ARM
+	/* Mask out thumb interop bit */
+	amodule->code = (void*)((mgreg_t)amodule->code & ~1);
+#endif
+	amodule->code_end = info->methods_end;
+	amodule->method_info_offsets = info->method_info_offsets;
+	amodule->ex_info_offsets = info->ex_info_offsets;
+	amodule->class_info_offsets = info->class_info_offsets;
+	amodule->class_name_table = info->class_name_table;
+	amodule->extra_method_table = info->extra_method_table;
+	amodule->extra_method_info_offsets = info->extra_method_info_offsets;
+	amodule->got_info_offsets = info->got_info_offsets;
+	amodule->unwind_info = info->unwind_info;
+	amodule->mem_end = info->mem_end;
 	amodule->mem_begin = amodule->code;
-
-	find_symbol (sofile, globals, "plt", (gpointer*)&amodule->plt);
-	find_symbol (sofile, globals, "plt_end", (gpointer*)&amodule->plt_end);
+	amodule->plt = info->plt;
+	amodule->plt_end = info->plt_end;
+	amodule->mono_eh_frame = info->mono_eh_frame;
+	amodule->trampolines [MONO_AOT_TRAMP_SPECIFIC] = info->specific_trampolines;
+	amodule->trampolines [MONO_AOT_TRAMP_STATIC_RGCTX] = info->static_rgctx_trampolines;
+	amodule->trampolines [MONO_AOT_TRAMP_IMT_THUNK] = info->imt_thunks;
+	amodule->thumb_end = info->thumb_end;
 
 	if (make_unreadable) {
 #ifndef TARGET_WIN32
@@ -1199,11 +1246,6 @@ load_aot_module (MonoAssembly *assembly, gpointer user_data)
 	mono_jit_info_add_aot_module (assembly->image, amodule->code, amodule->code_end);
 
 	assembly->image->aot_module = amodule;
- 
-#if defined(HAVE_DL_ITERATE_PHDR) && defined(PT_GNU_EH_FRAME)
-	/* Lookup the address of the .eh_frame_hdr () section if available */
-	dl_iterate_phdr (dl_callback, amodule);
-#endif	
 
 	if (mono_aot_only) {
 		if (mono_defaults.corlib) {
@@ -1232,8 +1274,20 @@ load_aot_module (MonoAssembly *assembly, gpointer user_data)
 	 * non-lazily, since we can't handle out-of-date errors later.
 	 * The cached class info also depends on the exact assemblies.
 	 */
-	for (i = 0; i < amodule->image_table_len; ++i)
-		load_image (amodule, i, FALSE);
+#if defined(__native_client__)
+	/* TODO: Don't 'load_image' on mscorlib due to a */
+	/* recursive loading problem.  This should be    */
+	/* removed if mscorlib is loaded from disk.      */
+	if (strncmp(assembly->aname.name, "mscorlib", 8)) {
+		do_load_image = TRUE;
+	} else {
+		do_load_image = FALSE;
+	}
+#endif
+	if (do_load_image) {
+		for (i = 0; i < amodule->image_table_len; ++i)
+			load_image (amodule, i, FALSE);
+	}
 
 	if (amodule->out_of_date) {
 		mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_AOT, "AOT Module %s is unusable because a dependency is out-of-date.\n", assembly->image->name);
@@ -1270,13 +1324,14 @@ mono_aot_register_module (gpointer *aot_info)
 {
 	gpointer *globals;
 	char *aname;
+	MonoAotFileInfo *info = (gpointer)aot_info;
 
-	globals = aot_info;
+	g_assert (info->version == MONO_AOT_FILE_VERSION);
+
+	globals = info->globals;
 	g_assert (globals);
 
-	/* Determine the assembly name */
-	find_symbol (NULL, globals, "mono_aot_assembly_name", (gpointer*)&aname);
-	g_assert (aname);
+	aname = info->assembly_name;
 
 	/* This could be called before startup */
 	if (aot_modules)
@@ -1285,7 +1340,7 @@ mono_aot_register_module (gpointer *aot_info)
 	if (!static_aot_modules)
 		static_aot_modules = g_hash_table_new (g_str_hash, g_str_equal);
 
-	g_hash_table_insert (static_aot_modules, aname, globals);
+	g_hash_table_insert (static_aot_modules, aname, info);
 
 	if (aot_modules)
 		mono_aot_unlock ();
@@ -1524,75 +1579,52 @@ mono_aot_get_class_from_name (MonoImage *image, const char *name_space, const ch
 	return TRUE;
 }
 
-#define DW_EH_PE_omit	0xff
-#define DW_EH_PE_uleb128 0x01
-#define DW_EH_PE_udata2	0x02
-#define DW_EH_PE_udata4	0x03
-#define DW_EH_PE_udata8	0x04
-#define DW_EH_PE_sleb128 0x09
-#define DW_EH_PE_sdata2	0x0A
-#define DW_EH_PE_sdata4	0x0B
-#define DW_EH_PE_sdata8	0x0C
-
-#define DW_EH_PE_absptr	0x00
-#define DW_EH_PE_pcrel	0x10
-#define DW_EH_PE_datarel 0x30
-#define DW_EH_PE_omit	0xff
-
-typedef struct
-{
-	guint8 version;
-	guint8 eh_frame_ptr_enc;
-	guint8 fde_count_enc;
-	guint8 table_enc;
-	guint8 rest;
-} eh_frame_hdr;
-
 /*
- * decode_eh_frame:
+ * decode_mono_eh_frame:
  *
- *   Decode the exception handling information in the .eh_frame section of the AOT
- * file belong to CODE, and construct a MonoJitInfo structure from it.
+ *   Decode the EH information emitted by our modified LLVM compiler and construct a
+ * MonoJitInfo structure from it.
  * LOCKING: Acquires the domain lock.
  */
-static G_GNUC_UNUSED MonoJitInfo*
-decode_eh_frame (MonoAotModule *amodule, MonoDomain *domain, 
-				 MonoMethod *method, guint8 *code, 
-				 MonoJitExceptionInfo *clauses, int num_clauses,
-				 int extra_size, GSList **nesting,
-				 int *this_reg, int *this_offset)
+static MonoJitInfo*
+decode_llvm_mono_eh_frame (MonoAotModule *amodule, MonoDomain *domain, 
+						   MonoMethod *method, guint8 *code, 
+						   MonoJitExceptionInfo *clauses, int num_clauses,
+						   int extra_size, GSList **nesting,
+						   int *this_reg, int *this_offset)
 {
-	eh_frame_hdr *hdr;
 	guint8 *p;
-	guint8 *eh_frame, *unwind_info;
-	guint32 eh_frame_ptr;
-	int fde_count;
+	guint8 *fde, *cie, *code_start, *code_end;
+	int version, fde_count;
 	gint32 *table;
-	int i, j, pos, left, right, offset, offset1, offset2;
-	guint32 unw_len, code_len;
+	int i, j, pos, left, right, offset, offset1, offset2, code_len;
 	MonoJitExceptionInfo *ei;
-	guint32 ei_len, nested_len, nindex;
+	guint32 fde_len, ei_len, nested_len, nindex;
 	gpointer *type_info;
 	MonoJitInfo *jinfo;
+	MonoLLVMFDEInfo info;
 
-	g_assert (amodule->eh_frame_hdr);
+	g_assert (amodule->mono_eh_frame);
 
-	// http://refspecs.freestandards.org/LSB_1.3.0/gLSB/gLSB/ehframehdr.html
-	hdr = (eh_frame_hdr*)amodule->eh_frame_hdr;
-	g_assert (hdr->version == 1);
-	g_assert (hdr->eh_frame_ptr_enc == (DW_EH_PE_pcrel | DW_EH_PE_sdata4));
-	g_assert (hdr->fde_count_enc == DW_EH_PE_udata4);
-	g_assert (hdr->table_enc == (DW_EH_PE_datarel | DW_EH_PE_sdata4));
+	p = amodule->mono_eh_frame;
 
-	p = &(hdr->rest);
-	eh_frame_ptr = *(guint32*)p;
-	p += 4;
+	/* p points to data emitted by LLVM in DwarfException::EmitMonoEHFrame () */
+
+	/* Header */
+	version = *p;
+	g_assert (version == 1);
+	p ++;
+	p = ALIGN_PTR_TO (p, 4);
+
 	fde_count = *(guint32*)p;
 	p += 4;
 	table = (gint32*)p;
 
+	/* There is +1 entry in the table */
+	cie = p + ((fde_count + 1) * 8);
+
 	/* Binary search in the table to find the entry for code */
-	offset = code - amodule->eh_frame_hdr;
+	offset = code - amodule->mono_eh_frame;
 
 	left = 0;
 	right = fde_count;
@@ -1614,25 +1646,36 @@ decode_eh_frame (MonoAotModule *amodule, MonoDomain *domain,
 			break;
 	}
 
-	g_assert (code >= amodule->eh_frame_hdr + table [(pos * 2)]);
-	if (pos + 1 < fde_count)
-		g_assert (code < amodule->eh_frame_hdr + table [(pos * 2) + 2]);
+	code_start = amodule->mono_eh_frame + table [(pos * 2)];
+	/* This won't overflow because there is +1 entry in the table */
+	code_end = amodule->mono_eh_frame + table [(pos * 2) + 2];
+	code_len = code_end - code_start;
 
-	eh_frame = amodule->eh_frame_hdr + table [(pos * 2) + 1];
+	g_assert (code >= code_start && code < code_end);
 
-	unwind_info = mono_unwind_decode_fde (eh_frame, &unw_len, &code_len, &ei, &ei_len, &type_info, this_reg, this_offset);
+	fde = amodule->mono_eh_frame + table [(pos * 2) + 1];	
+	/* This won't overflow because there is +1 entry in the table */
+	fde_len = table [(pos * 2) + 2 + 1] - table [(pos * 2) + 1];
+
+	mono_unwind_decode_llvm_mono_fde (fde, fde_len, cie, code_start, &info);
+	ei = info.ex_info;
+	ei_len = info.ex_info_len;
+	type_info = info.type_info;
+	*this_reg = info.this_reg;
+	*this_offset = info.this_offset;
 
 	/* Count number of nested clauses */
 	nested_len = 0;
 	for (i = 0; i < ei_len; ++i) {
-		gint32 cindex1 = *(gint32*)type_info [i];
+		/* This might be unaligned */
+		gint32 cindex1 = read32 (type_info [i]);
 		GSList *l;
 
 		for (l = nesting [cindex1]; l; l = l->next) {
 			gint32 nesting_cindex = GPOINTER_TO_INT (l->data);
 
 			for (j = 0; j < ei_len; ++j) {
-				gint32 cindex2 = *(gint32*)type_info [j];
+				gint32 cindex2 = read32 (type_info [j]);
 
 				if (cindex2 == nesting_cindex)
 					nested_len ++;
@@ -1648,7 +1691,7 @@ decode_eh_frame (MonoAotModule *amodule, MonoDomain *domain,
 		mono_domain_alloc0 (domain, MONO_SIZEOF_JIT_INFO + (sizeof (MonoJitExceptionInfo) * (ei_len + nested_len)) + extra_size);
 
 	jinfo->code_size = code_len;
-	jinfo->used_regs = mono_cache_unwind_info (unwind_info, unw_len);
+	jinfo->used_regs = mono_cache_unwind_info (info.unw_info, info.unw_info_len);
 	jinfo->method = method;
 	jinfo->code_start = code;
 	jinfo->domain_neutral = 0;
@@ -1662,7 +1705,7 @@ decode_eh_frame (MonoAotModule *amodule, MonoDomain *domain,
 		 * compiler, we have to combine that with the information produced by LLVM
 		 */
 		/* The type_info entries contain IL clause indexes */
-		int clause_index = *(gint32*)type_info [i];
+		int clause_index = read32 (type_info [i]);
 		MonoJitExceptionInfo *jei = &jinfo->clauses [i];
 		MonoJitExceptionInfo *orig_jei = &clauses [clause_index];
 
@@ -1673,19 +1716,23 @@ decode_eh_frame (MonoAotModule *amodule, MonoDomain *domain,
 		jei->try_start = ei [i].try_start;
 		jei->try_end = ei [i].try_end;
 		jei->handler_start = ei [i].handler_start;
+
+		/* Make sure we transition to thumb when a handler starts */
+		if (amodule->thumb_end && (guint8*)jei->handler_start < amodule->thumb_end)
+			jei->handler_start = (void*)((mgreg_t)jei->handler_start + 1);
 	}
 
 	/* See exception_cb () in mini-llvm.c as to why this is needed */
 	nindex = ei_len;
 	for (i = 0; i < ei_len; ++i) {
-		gint32 cindex1 = *(gint32*)type_info [i];
+		gint32 cindex1 = read32 (type_info [i]);
 		GSList *l;
 
 		for (l = nesting [cindex1]; l; l = l->next) {
 			gint32 nesting_cindex = GPOINTER_TO_INT (l->data);
 
 			for (j = 0; j < ei_len; ++j) {
-				gint32 cindex2 = *(gint32*)type_info [j];
+				gint32 cindex2 = read32 (type_info [j]);
 
 				if (cindex2 == nesting_cindex) {
 					/* 
@@ -1717,9 +1764,9 @@ decode_exception_debug_info (MonoAotModule *amodule, MonoDomain *domain,
 	MonoJitInfo *jinfo;
 	guint used_int_regs, flags;
 	gboolean has_generic_jit_info, has_dwarf_unwind_info, has_clauses, has_seq_points, has_try_block_holes;
-	gboolean from_llvm;
+	gboolean from_llvm, has_gc_map;
 	guint8 *p;
-	int generic_info_size, try_holes_info_size, num_holes, this_reg, this_offset;
+	int generic_info_size, try_holes_info_size, num_holes, this_reg = 0, this_offset = 0;
 
 	/* Load the method info from the AOT file */
 
@@ -1731,6 +1778,7 @@ decode_exception_debug_info (MonoAotModule *amodule, MonoDomain *domain,
 	has_seq_points = (flags & 8) != 0;
 	from_llvm = (flags & 16) != 0;
 	has_try_block_holes = (flags & 32) != 0;
+	has_gc_map = (flags & 64) != 0;
 
 	if (has_dwarf_unwind_info) {
 		guint32 offset;
@@ -1786,7 +1834,7 @@ decode_exception_debug_info (MonoAotModule *amodule, MonoDomain *domain,
 			}
 		}
 
- 		jinfo = decode_eh_frame (amodule, domain, method, code, clauses, num_clauses, generic_info_size + try_holes_info_size, nesting, &this_reg, &this_offset);
+ 		jinfo = decode_llvm_mono_eh_frame (amodule, domain, method, code, clauses, num_clauses, generic_info_size + try_holes_info_size, nesting, &this_reg, &this_offset);
 		jinfo->from_llvm = 1;
 
 		g_free (clauses);
@@ -1900,6 +1948,16 @@ decode_exception_debug_info (MonoAotModule *amodule, MonoDomain *domain,
 	/* Load debug info */
 	buf_len = decode_value (p, &p);
 	mono_debug_add_aot_method (domain, method, code, p, buf_len);
+	p += buf_len;
+
+	if (has_gc_map) {
+		int map_size = decode_value (p, &p);
+		/* The GC map requires 4 bytes of alignment */
+		while ((guint64)(gsize)p % 4)
+			p ++;		
+		jinfo->gc_info = p;
+		p += map_size;
+	}
 
 	if (amodule != jinfo->method->klass->image->aot_module) {
 		mono_aot_lock ();
@@ -1908,7 +1966,7 @@ decode_exception_debug_info (MonoAotModule *amodule, MonoDomain *domain,
 		g_hash_table_insert (ji_to_amodule, jinfo, amodule);
 		mono_aot_unlock ();		
 	}
-	
+
 	return jinfo;
 }
 
@@ -2028,7 +2086,6 @@ mono_aot_find_jit_info (MonoDomain *domain, MonoImage *image, gpointer addr)
 
 	/* Compute a sorted table mapping code offsets to method indexes. */
 	if (!amodule->sorted_code_offsets) {
-
 		code_offsets = g_new0 (gint32, nmethods * 2);
 		offsets_len = 0;
 		for (i = 0; i < nmethods; ++i) {
@@ -2449,6 +2506,12 @@ load_method (MonoDomain *domain, MonoAotModule *amodule, MonoImage *image, MonoM
 
 	info = &amodule->blob [mono_aot_get_offset (amodule->method_info_offsets, method_index)];
 
+	if (amodule->thumb_end && code < amodule->thumb_end) {
+		/* Convert this into a thumb address */
+		g_assert ((amodule->code_offsets [method_index] & 0x1) == 0);
+		code = &amodule->code [amodule->code_offsets [method_index] + 1];
+	}
+
 	mono_aot_lock ();
 	if (!amodule->methods_loaded)
 		amodule->methods_loaded = g_new0 (guint32, amodule->info.nmethods + 1);
@@ -2542,7 +2605,7 @@ load_method (MonoDomain *domain, MonoAotModule *amodule, MonoImage *image, MonoM
 		if (!jinfo)
 			jinfo = mono_aot_find_jit_info (domain, amodule->assembly->image, code);
 
-		mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_AOT, "AOT FOUND AOT compiled code for %s %p - %p %p\n", full_name, code, code + jinfo->code_size, info);
+		mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_AOT, "AOT FOUND method %s [%p - %p %p]\n", full_name, code, code + jinfo->code_size, info);
 		g_free (full_name);
 	}
 
@@ -3129,23 +3192,28 @@ init_plt (MonoAotModule *amodule)
 guint8*
 mono_aot_get_plt_entry (guint8 *code)
 {
-	MonoAotModule *aot_module = find_aot_module (code);
+	MonoAotModule *amodule = find_aot_module (code);
+	guint8 *target = NULL;
 
-	if (!aot_module)
+	if (!amodule)
 		return NULL;
 
-#ifdef MONO_ARCH_AOT_SUPPORTED
-	{
-		guint8 *target = mono_arch_get_call_target (code);
-
-		if ((target >= (guint8*)(aot_module->plt)) && (target < (guint8*)(aot_module->plt_end)))
-			return target;
+#ifdef TARGET_ARM
+	if (amodule->thumb_end && code < amodule->thumb_end) {
+		return mono_arm_get_thumb_plt_entry (code);
 	}
+#endif
+
+#ifdef MONO_ARCH_AOT_SUPPORTED
+	target = mono_arch_get_call_target (code);
 #else
 	g_assert_not_reached ();
 #endif
 
-	return NULL;
+	if ((target >= (guint8*)(amodule->plt)) && (target < (guint8*)(amodule->plt_end)))
+		return target;
+	else
+		return NULL;
 }
 
 /*

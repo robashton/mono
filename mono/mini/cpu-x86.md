@@ -247,6 +247,7 @@ call_handler: len:11 clob:c
 aot_const: dest:i len:5
 load_gotaddr: dest:i len:64
 got_entry: dest:i src1:b len:7
+nacl_gc_safe_point: clob:c
 x86_test_null: src1:i len:2
 x86_compare_membase_reg: src1:b src2:i len:7
 x86_compare_membase_imm: src1:b len:11
@@ -454,6 +455,8 @@ rcpps: dest:x src1:x len:4
 pshufflew_high: dest:x src1:x len:5
 pshufflew_low: dest:x src1:x len:5
 pshuffled: dest:x src1:x len:5
+shufps: dest:x src1:x src2:x len:4 clob:1
+shufpd: dest:x src1:x src2:x len:5 clob:1
 
 extract_mask: dest:i src1:x len:4
 
@@ -561,6 +564,15 @@ pshrq_reg: dest:x src1:x src2:x len:4 clob:1
 pshlq: dest:x src1:x len:5 clob:1
 pshlq_reg: dest:x src1:x src2:x len:4 clob:1
 
+cvtdq2pd: dest:x src1:x len:4 clob:1
+cvtdq2ps: dest:x src1:x len:3 clob:1
+cvtpd2dq: dest:x src1:x len:4 clob:1
+cvtpd2ps: dest:x src1:x len:4 clob:1
+cvtps2dq: dest:x src1:x len:4 clob:1
+cvtps2pd: dest:x src1:x len:3 clob:1
+cvttpd2dq: dest:x src1:x len:4 clob:1
+cvttps2dq: dest:x src1:x len:4 clob:1
+
 xmove: dest:x src1:x len:4
 xzero: dest:x len:4
 
@@ -605,3 +617,7 @@ expand_r8: dest:x src1:f len:13
 
 liverange_start: len:0
 liverange_end: len:0
+gc_liveness_def: len:0
+gc_liveness_use: len:0
+gc_spill_slot_liveness_def: len:0
+gc_param_slot_liveness_def: len:0

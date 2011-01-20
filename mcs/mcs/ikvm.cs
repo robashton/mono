@@ -55,14 +55,13 @@ namespace Mono.CSharp
 		{
 			string name = baseType.Name;
 
-			// TODO: namespace check
-			if (name == "ValueType")
+			if (name == "ValueType" && baseType.Namespace == "System")
 				return MemberKind.Struct;
 
-			if (name == "Enum")
+			if (name == "Enum" && baseType.Namespace == "System")
 				return MemberKind.Enum;
 
-			if (name == "MulticastDelegate")
+			if (name == "MulticastDelegate" && baseType.Namespace == "System")
 				return MemberKind.Delegate;
 
 			return MemberKind.Class;
@@ -80,7 +79,7 @@ namespace Mono.CSharp
 
 		public override void GetCustomAttributeTypeName (CustomAttributeData cad, out string typeNamespace, out string typeName)
 		{
-			cad.__ReadTypeName (out typeNamespace, out typeName);
+			cad.__TryReadTypeName (out typeNamespace, out typeName);
 		}
 
 		public void ImportAssembly (Assembly assembly, RootNamespace targetNamespace)
@@ -129,29 +128,32 @@ namespace Mono.CSharp
 		//
 		// Initializes the code generator
 		//
-		public bool Create (Universe domain)
+		public bool Create (StaticLoader loader)
 		{
 			ResolveAssemblySecurityAttributes ();
 			var an = CreateAssemblyName ();
 
-			Builder = domain.DefineDynamicAssembly (an, AssemblyBuilderAccess.Save, Path.GetDirectoryName (file_name));
+			Builder = loader.Domain.DefineDynamicAssembly (an, AssemblyBuilderAccess.Save, Path.GetDirectoryName (file_name));
 
-			// Sets output file metadata version, this makes sense for mscorlib
-			// compilation only but won't restrict that for now
-			switch (RootContext.StdLibRuntimeVersion){
-			case RuntimeVersion.v4:
-				Builder.__SetImageRuntimeVersion ("v4.0.30319", 0x20000);
-				break;
-			case RuntimeVersion.v2:
-				Builder.__SetImageRuntimeVersion ("v2.0.50727", 0x20000);
-				break;
-			case RuntimeVersion.v1:
-				// Compiler does not do any checks whether the produced metadata
-				// are valid in the context of 1.0 stream version
-				Builder.__SetImageRuntimeVersion ("v1.1.4322", 0x10000);
-				break;
-			default:
-				throw new NotImplementedException ();
+			if (loader.Corlib != null) {
+				Builder.__SetImageRuntimeVersion (loader.Corlib.ImageRuntimeVersion, 0x20000);
+			} else {
+				// Sets output file metadata version when there is no mscorlib
+				switch (RootContext.StdLibRuntimeVersion) {
+				case RuntimeVersion.v4:
+					Builder.__SetImageRuntimeVersion ("v4.0.30319", 0x20000);
+					break;
+				case RuntimeVersion.v2:
+					Builder.__SetImageRuntimeVersion ("v2.0.50727", 0x20000);
+					break;
+				case RuntimeVersion.v1:
+					// Compiler does not do any checks whether the produced metadata
+					// are valid in the context of 1.0 stream version
+					Builder.__SetImageRuntimeVersion ("v1.1.4322", 0x10000);
+					break;
+				default:
+					throw new NotImplementedException ();
+				}
 			}
 
 			builder_extra = new AssemblyBuilderIKVM (Builder, Compiler);
@@ -174,6 +176,15 @@ namespace Mono.CSharp
 		readonly StaticImporter importer;
 		readonly Universe domain;
 		Assembly corlib;
+		List<Tuple<AssemblyName, string, Assembly>> loaded_names;
+		static readonly Dictionary<SdkVersion, string[]> sdk_directory;
+
+		static StaticLoader ()
+		{
+			sdk_directory = new Dictionary<SdkVersion, string[]> ();
+			sdk_directory.Add (SdkVersion.v2, new string[] { "2.0", "net_2_0", "v2.0.50727" });
+			sdk_directory.Add (SdkVersion.v4, new string[] { "4.0", "net_4_0", "v4.0.30319" });
+		}
 
 		public StaticLoader (StaticImporter importer, CompilerContext compiler)
 			: base (compiler)
@@ -181,6 +192,26 @@ namespace Mono.CSharp
 			this.importer = importer;
 			domain = new Universe ();
 			domain.AssemblyResolve += AssemblyReferenceResolver;
+			loaded_names = new List<Tuple<AssemblyName, string, Assembly>> ();
+
+			var corlib_path = Path.GetDirectoryName (typeof (object).Assembly.Location);
+			string fx_path = corlib_path.Substring (0, corlib_path.LastIndexOf (Path.DirectorySeparatorChar));
+			string sdk_path = null;
+
+			foreach (var dir in sdk_directory[RootContext.SdkVersion]) {
+				sdk_path = Path.Combine (fx_path, dir);
+				if (File.Exists (Path.Combine (sdk_path, "mscorlib.dll")))
+					break;
+
+				sdk_path = null;
+			}
+
+			if (sdk_path == null) {
+				compiler.Report.Warning (-1, 1, "SDK path could not be resolved");
+				sdk_path = corlib_path;
+			}
+
+			paths.Add (sdk_path);
 		}
 
 		public Assembly Corlib {
@@ -200,12 +231,77 @@ namespace Mono.CSharp
 
 		Assembly AssemblyReferenceResolver (object sender, IKVM.Reflection.ResolveEventArgs args)
 		{
-			if (args.Name == "mscorlib")
+			var refname = args.Name;
+			if (refname == "mscorlib")
 				return corlib;
+
+			Assembly version_mismatch = null;
+			bool is_fx_assembly = false;
+
+			foreach (var assembly in domain.GetAssemblies ()) {
+				// TODO: Cannot handle unification into current assembly yet
+				if (assembly is AssemblyBuilder)
+					continue;
+
+				AssemblyComparisonResult result;
+				if (!Fusion.CompareAssemblyIdentityPure (refname, false, assembly.FullName, false, out result)) {
+					if ((result == AssemblyComparisonResult.NonEquivalentVersion || result == AssemblyComparisonResult.NonEquivalentPartialVersion) &&
+						(version_mismatch == null || version_mismatch.GetName ().Version < assembly.GetName ().Version) &&
+						!is_fx_assembly) {
+						version_mismatch = assembly;
+					}
+
+					continue;
+				}
+
+				if (result == AssemblyComparisonResult.EquivalentFullMatch ||
+					result == AssemblyComparisonResult.EquivalentWeakNamed ||
+					result == AssemblyComparisonResult.EquivalentPartialMatch) {
+					return assembly;
+				}
+
+				if (result == AssemblyComparisonResult.EquivalentFXUnified) {
+					is_fx_assembly = true;
+
+					if (version_mismatch == null || version_mismatch.GetName ().Version < assembly.GetName ().Version)
+						version_mismatch = assembly;
+
+					continue;
+				}
+
+				throw new NotImplementedException ("Assembly equality = " + result.ToString ());
+			}
+
+			if (version_mismatch != null) {
+				var v1 = new AssemblyName (refname).Version;
+				var v2 = version_mismatch.GetName ().Version;
+
+				if (v1 > v2) {
+//					compiler.Report.SymbolRelatedToPreviousError (args.RequestingAssembly.Location);
+					compiler.Report.Error (1705, "Assembly `{0}' references `{1}' which has higher version number than imported assembly `{2}'",
+						args.RequestingAssembly.FullName, refname, version_mismatch.GetName ().FullName);
+
+					return domain.CreateMissingAssembly (args.Name);
+				}
+
+				if (!is_fx_assembly) {
+					if (v1.Major != v2.Major || v1.Minor != v2.Minor) {
+						compiler.Report.Warning (1701, 2,
+							"Assuming assembly reference `{0}' matches assembly `{1}'. You may need to supply runtime policy",
+							refname, version_mismatch.GetName ().FullName);
+					} else {
+						compiler.Report.Warning (1702, 3,
+							"Assuming assembly reference `{0}' matches assembly `{1}'. You may need to supply runtime policy",
+							refname, version_mismatch.GetName ().FullName);
+					}
+				}
+
+				return version_mismatch;
+			}
 
 			// AssemblyReference has not been found in the domain
 			// create missing reference and continue
-			return new MissingAssembly (domain, args.Name);
+			return domain.CreateMissingAssembly (args.Name);
 		}
 
 		public void Dispose ()
@@ -219,17 +315,10 @@ namespace Mono.CSharp
 			// For now the "default config" is harcoded into the compiler
 			// we can move this outside later
 			//
-			var default_references = new List<string> (8);
+			var default_references = new List<string> (4);
 
 			default_references.Add ("System.dll");
 			default_references.Add ("System.Xml.dll");
-#if NET_2_1
-			default_references.Add ("System.Net.dll");
-			default_references.Add ("System.Windows.dll");
-			default_references.Add ("System.Windows.Browser.dll");
-#endif
-
-			// TODO: Will have to do it based on mscorlib version or something like that
 
 			if (RootContext.Version > LanguageVersion.ISO_2)
 				default_references.Add ("System.Core.dll");
@@ -249,6 +338,9 @@ namespace Mono.CSharp
 			bool? has_extension = null;
 			foreach (var path in paths) {
 				var file = Path.Combine (path, fileName);
+				if (Report.DebugFlags > 0)
+					Console.WriteLine ("Probing assembly location `{0}'", file);
+
 				if (!File.Exists (file)) {
 					if (!has_extension.HasValue)
 						has_extension = fileName.EndsWith (".dll", StringComparison.Ordinal) || fileName.EndsWith (".exe", StringComparison.Ordinal);
@@ -268,7 +360,46 @@ namespace Mono.CSharp
 							return null;
 						}
 
-						return domain.LoadAssembly (module);
+						//
+						// check whether the assembly can be actually imported without
+						// collision
+						//
+						var an = module.GetAssemblyName ();
+						foreach (var entry in loaded_names) {
+							var loaded_name = entry.Item1;
+							if (an.Name != loaded_name.Name)
+								continue;
+
+							if (an.CodeBase == loaded_name.CodeBase)
+								return entry.Item3;
+							
+							if (((an.Flags | loaded_name.Flags) & AssemblyNameFlags.PublicKey) == 0) {
+								compiler.Report.SymbolRelatedToPreviousError (entry.Item2);
+								compiler.Report.SymbolRelatedToPreviousError (fileName);
+								compiler.Report.Error (1704,
+									"An assembly with the same name `{0}' has already been imported. Consider removing one of the references or sign the assembly",
+									an.Name);
+								return null;
+							}
+
+							if ((an.Flags & AssemblyNameFlags.PublicKey) == (loaded_name.Flags & AssemblyNameFlags.PublicKey) && an.Version.Equals (loaded_name.Version)) {
+								compiler.Report.SymbolRelatedToPreviousError (entry.Item2);
+								compiler.Report.SymbolRelatedToPreviousError (fileName);
+								compiler.Report.Error (1703,
+									"An assembly with the same identity `{0}' has already been imported. Consider removing one of the references",
+									an.FullName);
+								return null;
+							}
+						}
+
+						if (Report.DebugFlags > 0)
+							Console.WriteLine ("Loading assembly `{0}'", fileName);
+
+						var assembly = domain.LoadAssembly (module);
+						if (assembly != null)
+							loaded_names.Add (Tuple.Create (an, fileName, assembly));
+
+						return assembly;
 					}
 				} catch {
 					Error_FileCorrupted (file);
@@ -312,11 +443,23 @@ namespace Mono.CSharp
 		{
 			foreach (var path in paths) {
 				var file = Path.Combine (path, assembly);
+
+				if (Report.DebugFlags > 0)
+					Console.WriteLine ("Probing default assembly location `{0}'", file);
+
 				if (!File.Exists (file))
 					continue;
 
 				try {
-					return domain.LoadFile (file);
+					if (Report.DebugFlags > 0)
+						Console.WriteLine ("Loading default assembly `{0}'", file);
+
+					var a = domain.LoadFile (file);
+					if (a != null) {
+						loaded_names.Add (Tuple.Create (a.GetName (), file, a));
+					}
+
+					return a;
 				} catch {
 					// Default assemblies can fail to load without error
 					return null;
@@ -358,270 +501,6 @@ namespace Mono.CSharp
 
 				var md = importer.ImportModule (assembly.IncludeModule (m), targetNamespace);
 				assembly.AddModule (md);
-			}
-		}
-	}
-
-	//
-	// Represents missing assembly reference
-	//
-	class MissingAssembly : Assembly
-	{
-		class MissingModule : Module
-		{
-			readonly Assembly assembly;
-
-			public MissingModule (Universe universe, Assembly assembly)
-				: base (universe)
-			{
-				this.assembly = assembly;
-			}
-
-			public override int MDStreamVersion {
-				get {
-					throw new NotImplementedException ();
-				}
-			}
-
-			public override Assembly Assembly {
-				get {
-					return assembly;
-				}
-			}
-
-			public override string FullyQualifiedName {
-				get {
-					throw new NotImplementedException ();
-				}
-			}
-
-			public override string Name {
-				get {
-					throw new NotImplementedException ();
-				}
-			}
-
-			public override Guid ModuleVersionId {
-				get {
-					throw new NotImplementedException ();
-				}
-			}
-
-			public override MetaType ResolveType (int metadataToken, MetaType[] genericTypeArguments, MetaType[] genericMethodArguments)
-			{
-				throw new NotImplementedException ();
-			}
-
-			public override MethodBase ResolveMethod (int metadataToken, MetaType[] genericTypeArguments, MetaType[] genericMethodArguments)
-			{
-				throw new NotImplementedException ();
-			}
-
-			public override FieldInfo ResolveField (int metadataToken, MetaType[] genericTypeArguments, MetaType[] genericMethodArguments)
-			{
-				throw new NotImplementedException ();
-			}
-
-			public override MemberInfo ResolveMember (int metadataToken, MetaType[] genericTypeArguments, MetaType[] genericMethodArguments)
-			{
-				throw new NotImplementedException ();
-			}
-
-			public override string ResolveString (int metadataToken)
-			{
-				throw new NotImplementedException ();
-			}
-
-			public override MetaType[] __ResolveOptionalParameterTypes (int metadataToken)
-			{
-				throw new NotImplementedException ();
-			}
-
-			public override string ScopeName {
-				get {
-					throw new NotImplementedException ();
-				}
-			}
-
-			internal override MetaType GetTypeImpl (string typeName)
-			{
-				throw new NotImplementedException ();
-			}
-
-			internal override void GetTypesImpl (List<MetaType> list)
-			{
-				throw new NotImplementedException ();
-			}
-
-			public override AssemblyName[] __GetReferencedAssemblies ()
-			{
-				throw new NotImplementedException ();
-			}
-
-			internal override MetaType GetModuleType ()
-			{
-				throw new NotImplementedException ();
-			}
-
-			internal override IKVM.Reflection.Reader.ByteReader GetBlob (int blobIndex)
-			{
-				throw new NotImplementedException ();
-			}
-		}
-
-		readonly string full_name;
-		readonly Module module;
-		Dictionary<string, MetaType> types;
-
-		public MissingAssembly (Universe universe, string fullName)
-			: base (universe)
-		{
-			this.full_name = fullName;
-			this.module = new MissingModule (universe, this);
-			types = new Dictionary<string, MetaType> ();
-		}
-
-		public override MetaType[] GetTypes ()
-		{
-			throw new NotImplementedException ();
-		}
-
-		public override string FullName {
-			get {
-				return full_name;
-			}
-		}
-
-		public override AssemblyName GetName ()
-		{
-			throw new NotImplementedException ();
-		}
-
-		public override string ImageRuntimeVersion {
-			get {
-				throw new NotImplementedException ();
-			}
-		}
-
-		public override Module ManifestModule {
-			get {
-				return module;
-			}
-		}
-
-		public override MethodInfo EntryPoint {
-			get {
-				throw new NotImplementedException ();
-			}
-		}
-
-		public override string Location {
-			get {
-				throw new NotImplementedException ();
-			}
-		}
-
-		public override AssemblyName[] GetReferencedAssemblies ()
-		{
-			throw new NotImplementedException ();
-		}
-
-		public override Module[] GetModules (bool getResourceModules)
-		{
-			throw new NotImplementedException ();
-		}
-
-		public override Module[] GetLoadedModules (bool getResourceModules)
-		{
-			throw new NotImplementedException ();
-		}
-
-		public override Module GetModule (string name)
-		{
-			throw new NotImplementedException ();
-		}
-
-		public override string[] GetManifestResourceNames ()
-		{
-			throw new NotImplementedException ();
-		}
-
-		public override ManifestResourceInfo GetManifestResourceInfo (string resourceName)
-		{
-			throw new NotImplementedException ();
-		}
-
-		public override Stream GetManifestResourceStream (string resourceName)
-		{
-			throw new NotImplementedException ();
-		}
-
-		internal override MetaType GetTypeImpl (string typeName)
-		{
-			//
-			// We are loading a type from missing reference
-			// this itself is fine. The error will be reported
-			// later when the type is actually used
-			//
-			MetaType t;
-			if (!types.TryGetValue (typeName, out t)) {
-				t = new MissingType (typeName, this);
-				types.Add (typeName, t);
-			}
-
-			return t;
-		}
-
-		internal override IList<CustomAttributeData> GetCustomAttributesData (MetaType attributeType)
-		{
-			throw new NotImplementedException ();
-		}
-	}
-
-	class MissingType : MetaType
-	{
-		readonly string full_name;
-		readonly MissingAssembly assembly;
-
-		public MissingType (string typeName, MissingAssembly assembly)
-		{
-			this.full_name = typeName;
-			this.assembly = assembly;
-		}
-
-		public override TypeAttributes Attributes {
-			get {
-				// TODO: Don't know yet
-				return TypeAttributes.Public;
-			}
-		}
-
-		public override MetaType BaseType {
-			get {
-				return null;
-			}
-		}
-
-		public override string FullName {
-			get {
-				return full_name;
-			}
-		}
-
-		internal override MetaType GetGenericTypeArgument (int index)
-		{
-			return new MissingType ("#" + index.ToString (), assembly);
-		}
-
-		public override bool IsGenericTypeDefinition {
-			get {
-				return full_name.IndexOf ('`') > 0;
-			}
-		}
-
-		public override Module Module {
-			get {
-				return assembly.ManifestModule;
 			}
 		}
 	}

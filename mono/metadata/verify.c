@@ -234,6 +234,9 @@ mono_method_is_valid_generic_instantiation (VerifyContext *ctx, MonoMethod *meth
 
 static MonoGenericParam*
 verifier_get_generic_param_from_type (VerifyContext *ctx, MonoType *type);
+
+static gboolean
+verifier_class_is_assignable_from (MonoClass *target, MonoClass *candidate);
 //////////////////////////////////////////////////////////////////
 
 
@@ -495,17 +498,17 @@ mono_type_is_valid_type_in_context_full (MonoType *type, MonoGenericContext *con
 			return FALSE;
 		break;
 	case MONO_TYPE_SZARRAY:
-		return mono_type_is_valid_type_in_context_full (&type->data.klass->byval_arg, context, TRUE);
+		return mono_type_is_valid_type_in_context_full (&type->data.klass->byval_arg, context, check_gtd);
 	case MONO_TYPE_ARRAY:
-		return mono_type_is_valid_type_in_context_full (&type->data.array->eklass->byval_arg, context, TRUE);
+		return mono_type_is_valid_type_in_context_full (&type->data.array->eklass->byval_arg, context, check_gtd);
 	case MONO_TYPE_PTR:
-		return mono_type_is_valid_type_in_context_full (type->data.type, context, TRUE);
+		return mono_type_is_valid_type_in_context_full (type->data.type, context, check_gtd);
 	case MONO_TYPE_GENERICINST:
 		inst = type->data.generic_class->context.class_inst;
 		if (!inst->is_open)
 			break;
 		for (i = 0; i < inst->type_argc; ++i)
-			if (!mono_type_is_valid_type_in_context_full (inst->type_argv [i], context, TRUE))
+			if (!mono_type_is_valid_type_in_context_full (inst->type_argv [i], context, check_gtd))
 				return FALSE;
 		break;
 	case MONO_TYPE_CLASS:
@@ -516,7 +519,7 @@ mono_type_is_valid_type_in_context_full (MonoType *type, MonoGenericContext *con
 		 * Fixing the type decoding is really tricky since under some cases this behavior is needed, for example, to
 		 * have a 'class' type pointing to a 'genericinst' class.
 		 *
-		 * For the runtime these non canonical (weird) encodings work fine, they worst they can cause is some
+		 * For the runtime these non canonical (weird) encodings work fine, the worst they can cause is some
 		 * reflection oddities which are harmless  - to security at least.
 		 */
 		if (klass->byval_arg.type != type->type)
@@ -551,7 +554,9 @@ verifier_inflate_type (VerifyContext *ctx, MonoType *type, MonoGenericContext *c
 	return result;
 }
 
-
+/*A side note here. We don't need to check if arguments are broken since this
+is only need to be done by the runtime before realizing the type.
+*/
 static gboolean
 is_valid_generic_instantiation (MonoGenericContainer *gc, MonoGenericContext *context, MonoGenericInst *ginst)
 {
@@ -573,8 +578,6 @@ is_valid_generic_instantiation (MonoGenericContainer *gc, MonoGenericContext *co
 
 		paramClass = mono_class_from_mono_type (param_type);
 
-		if (paramClass->exception_type != MONO_EXCEPTION_NONE)
-			return FALSE;
 
 		/* A GTD can't be a generic argument.
 		 *
@@ -624,6 +627,7 @@ is_valid_generic_instantiation (MonoGenericContainer *gc, MonoGenericContext *co
 			ctr = mono_class_from_mono_type (inflated);
 			mono_metadata_free_type (inflated);
 
+			/*FIXME maybe we need the same this as verifier_class_is_assignable_from*/
 			if (!mono_class_is_assignable_from_slow (ctr, paramClass))
 				return FALSE;
 		}
@@ -641,14 +645,40 @@ mono_generic_param_is_constraint_compatible (VerifyContext *ctx, MonoGenericPara
 {
 	MonoGenericParamInfo *tinfo = mono_generic_param_info (target);
 	MonoGenericParamInfo *cinfo = mono_generic_param_info (candidate);
+	MonoClass **candidate_class;
+	gboolean class_constraint_satisfied = FALSE;
+	gboolean valuetype_constraint_satisfied = FALSE;
 
 	int tmask = tinfo->flags & GENERIC_PARAMETER_ATTRIBUTE_SPECIAL_CONSTRAINTS_MASK;
 	int cmask = cinfo->flags & GENERIC_PARAMETER_ATTRIBUTE_SPECIAL_CONSTRAINTS_MASK;
-	if ((tmask & cmask) != tmask)
+
+	if ((tmask & GENERIC_PARAMETER_ATTRIBUTE_CONSTRUCTOR_CONSTRAINT) && !(cmask & GENERIC_PARAMETER_ATTRIBUTE_CONSTRUCTOR_CONSTRAINT))
+		return FALSE;
+	if (cinfo->constraints) {
+		for (candidate_class = cinfo->constraints; *candidate_class; ++candidate_class) {
+			MonoClass *cc;
+			MonoType *inflated = verifier_inflate_type (ctx, &(*candidate_class)->byval_arg, ctx->generic_context);
+			if (!inflated)
+				return FALSE;
+			cc = mono_class_from_mono_type (inflated);
+			mono_metadata_free_type (inflated);
+
+			if (mono_type_is_reference (&cc->byval_arg) && !MONO_CLASS_IS_INTERFACE (cc))
+				class_constraint_satisfied = TRUE;
+			else if (!mono_type_is_reference (&cc->byval_arg) && !MONO_CLASS_IS_INTERFACE (cc))
+				valuetype_constraint_satisfied = TRUE;
+		}
+	}
+	class_constraint_satisfied |= (cmask & GENERIC_PARAMETER_ATTRIBUTE_REFERENCE_TYPE_CONSTRAINT) != 0;
+	valuetype_constraint_satisfied |= (cmask & GENERIC_PARAMETER_ATTRIBUTE_VALUE_TYPE_CONSTRAINT) != 0;
+
+	if ((tmask & GENERIC_PARAMETER_ATTRIBUTE_REFERENCE_TYPE_CONSTRAINT) && !class_constraint_satisfied)
+		return FALSE;
+	if ((tmask & GENERIC_PARAMETER_ATTRIBUTE_VALUE_TYPE_CONSTRAINT) && !valuetype_constraint_satisfied)
 		return FALSE;
 
 	if (tinfo->constraints) {
-		MonoClass **target_class, **candidate_class;
+		MonoClass **target_class;
 		for (target_class = tinfo->constraints; *target_class; ++target_class) {
 			MonoClass *tc;
 			MonoType *inflated = verifier_inflate_type (ctx, &(*target_class)->byval_arg, context);
@@ -675,7 +705,7 @@ mono_generic_param_is_constraint_compatible (VerifyContext *ctx, MonoGenericPara
 				cc = mono_class_from_mono_type (inflated);
 				mono_metadata_free_type (inflated);
 
-				if (mono_class_is_assignable_from (tc, cc))
+				if (verifier_class_is_assignable_from (tc, cc))
 					break;
 
 				/*
@@ -1847,7 +1877,7 @@ is_array_type_compatible (MonoType *target, MonoType *candidate)
 	if (left->rank != right->rank)
 		return FALSE;
 
-	return mono_class_is_assignable_from (left->eklass, right->eklass);
+	return verifier_class_is_assignable_from (left->eklass, right->eklass);
 }
 
 static int
@@ -2030,6 +2060,34 @@ init_stack_with_value_at_exception_boundary (VerifyContext *ctx, ILCodeDesc *cod
 		code->stack->stype |= BOXED_MASK;
 }
 
+static gboolean
+verifier_class_is_assignable_from (MonoClass *target, MonoClass *candidate)
+{
+	static MonoClass* generic_icollection_class = NULL;
+	static MonoClass* generic_ienumerable_class = NULL;
+	MonoClass *iface_gtd;
+
+	if (mono_class_is_assignable_from (target, candidate))
+		return TRUE;
+
+	if (!MONO_CLASS_IS_INTERFACE (target) || !target->generic_class || candidate->rank != 1)
+		return FALSE;
+
+	if (generic_icollection_class == NULL) {
+		generic_icollection_class = mono_class_from_name (mono_defaults.corlib,
+			"System.Collections.Generic", "ICollection`1");
+		generic_ienumerable_class = mono_class_from_name (mono_defaults.corlib,
+			"System.Collections.Generic", "IEnumerable`1");
+	}
+	iface_gtd = target->generic_class->container_class;
+	if (iface_gtd != mono_defaults.generic_ilist_class && iface_gtd != generic_icollection_class && iface_gtd != generic_ienumerable_class)
+		return FALSE;
+
+	target = mono_class_from_mono_type (target->generic_class->context.class_inst->type_argv [0]);
+	candidate = candidate->element_class;
+	return mono_class_is_assignable_from (target, candidate);
+}
+
 /*Verify if type 'candidate' can be stored in type 'target'.
  * 
  * If strict, check for the underlying type and not the verification stack types
@@ -2137,8 +2195,7 @@ handle_enum:
 				return FALSE;
 			return target_klass == candidate_klass;
 		}
-		
-		return mono_class_is_assignable_from (target_klass, candidate_klass);
+		return verifier_class_is_assignable_from (target_klass, candidate_klass);
 	}
 
 	case MONO_TYPE_STRING:
@@ -2158,7 +2215,7 @@ handle_enum:
 		/* If candidate is an enum it should return true for System.Enum and supertypes.
 		 * That's why here we use the original type and not the underlying type.
 		 */ 
-		return mono_class_is_assignable_from (target->data.klass, mono_class_from_mono_type (original_candidate));
+		return verifier_class_is_assignable_from (target->data.klass, mono_class_from_mono_type (original_candidate));
 
 	case MONO_TYPE_OBJECT:
 		return MONO_TYPE_IS_REFERENCE (candidate);
@@ -2172,7 +2229,7 @@ handle_enum:
 		left = mono_class_from_mono_type (target);
 		right = mono_class_from_mono_type (candidate);
 
-		return mono_class_is_assignable_from (left, right);
+		return verifier_class_is_assignable_from (left, right);
 	}
 
 	case MONO_TYPE_ARRAY:
@@ -2315,7 +2372,7 @@ is_compatible_boxed_valuetype (VerifyContext *ctx, MonoType *type, MonoType *can
 	if (!strict)
 		return TRUE;
 
-	return MONO_TYPE_IS_REFERENCE (type) && mono_class_is_assignable_from (mono_class_from_mono_type (type), mono_class_from_mono_type (candidate));
+	return MONO_TYPE_IS_REFERENCE (type) && verifier_class_is_assignable_from (mono_class_from_mono_type (type), mono_class_from_mono_type (candidate));
 }
 
 static int
@@ -2388,18 +2445,18 @@ mono_delegate_type_equal (MonoType *target, MonoType *candidate)
 		target_klass = mono_class_from_mono_type (target);
 		candidate_klass = mono_class_from_mono_type (candidate);
 		/*FIXME handle nullables and enum*/
-		return mono_class_is_assignable_from (target_klass, candidate_klass);
+		return verifier_class_is_assignable_from (target_klass, candidate_klass);
 	}
 	case MONO_TYPE_OBJECT:
 		return MONO_TYPE_IS_REFERENCE (candidate);
 
 	case MONO_TYPE_CLASS:
-		return mono_class_is_assignable_from(target->data.klass, mono_class_from_mono_type (candidate));
+		return verifier_class_is_assignable_from(target->data.klass, mono_class_from_mono_type (candidate));
 
 	case MONO_TYPE_SZARRAY:
 		if (candidate->type != MONO_TYPE_SZARRAY)
 			return FALSE;
-		return mono_class_is_assignable_from (mono_class_from_mono_type (target)->element_class, mono_class_from_mono_type (candidate)->element_class);
+		return verifier_class_is_assignable_from (mono_class_from_mono_type (target)->element_class, mono_class_from_mono_type (candidate)->element_class);
 
 	case MONO_TYPE_ARRAY:
 		if (candidate->type != MONO_TYPE_ARRAY)
@@ -4610,6 +4667,12 @@ mono_method_verify (MonoMethod *method, int level)
 		finish_collect_stats ();
 		return ctx.list;
 	}
+	if (!method->is_generic && !method->klass->is_generic && ctx.signature->has_type_parameters) {
+		ADD_VERIFY_ERROR (&ctx, g_strdup_printf ("Method and signature don't match in terms of genericity"));
+		finish_collect_stats ();
+		return ctx.list;
+	}
+
 	ctx.header = mono_method_get_header (method);
 	if (!ctx.header) {
 		ADD_VERIFY_ERROR (&ctx, g_strdup_printf ("Could not decode method header"));
@@ -6060,6 +6123,13 @@ mono_verifier_verify_class (MonoClass *class)
 			return FALSE;
 		if (!class->generic_class && class->parent->generic_container)
 			return FALSE;
+		if (class->parent->generic_class && !class->generic_class) {
+			MonoGenericContext *context = mono_class_get_context (class);
+			if (class->generic_container)
+				context = &class->generic_container->context;
+			if (!mono_type_is_valid_type_in_context (&class->parent->byval_arg, context))
+				return FALSE;
+		}
 	}
 	if (class->generic_container && (class->flags & TYPE_ATTRIBUTE_LAYOUT_MASK) == TYPE_ATTRIBUTE_EXPLICIT_LAYOUT)
 		return FALSE;

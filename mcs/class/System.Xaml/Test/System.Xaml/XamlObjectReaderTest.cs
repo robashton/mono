@@ -145,6 +145,16 @@ namespace MonoTests.System.Xaml
 		}
 
 		[Test]
+		public void Skip3 ()
+		{
+			var r = new XamlObjectReader (new ReadOnlyPropertyContainer () { Foo = "x" });
+			while (r.NodeType != XamlNodeType.StartMember)
+				r.Read ();
+			r.Skip ();
+			Assert.AreEqual (XamlNodeType.EndObject, r.NodeType, "#1");
+		}
+
+		[Test]
 		public void Read_XmlDocument ()
 		{
 			var doc = new XmlDocument ();
@@ -613,6 +623,60 @@ namespace MonoTests.System.Xaml
 			obj.Add (new XmlSerializable ("<root/>"));
 			var xr = new XamlObjectReader (obj);
 			Read_ListXmlSerializable (xr);
+		}
+		
+		[Test]
+		public void Read_AttachedProperty ()
+		{
+			var obj = new AttachedWrapper ();
+			Attachable.SetFoo (obj, "x");
+			Attachable.SetFoo (obj.Value, "y");
+			try {
+				var xr = new XamlObjectReader (obj);
+				Read_AttachedProperty (xr);
+			} finally {
+				Attachable.SetFoo (obj, null);
+				Attachable.SetFoo (obj.Value, null);
+			}
+		}
+		
+		[Test]
+		[Ignore ("Foo does not work as attached properties in this test yet")]
+		public void Read_AttachedProperty2 ()
+		{
+			var obj = new AttachedWrapper2 ();
+			AttachedWrapper2.SetFoo (obj, "x");
+			AttachedWrapper2.SetFoo (obj.Value, "y");
+			try {
+				var xr = new XamlObjectReader (obj);
+//while (xr.Read ()) Console.Error.WriteLine ("{0} {1} {2} {3}", xr.NodeType, xr.Type, xr.Member, xr.Value);
+			} finally {
+				AttachedWrapper2.SetFoo (obj, null);
+				AttachedWrapper2.SetFoo (obj.Value, null);
+			}
+		}
+
+		[Test]
+		public void Read_AbstractContainer ()
+		{
+			var obj = new AbstractContainer () { Value2 = new DerivedObject () { Foo = "x" } };
+			var xr = new XamlObjectReader (obj);
+			while (!xr.IsEof)
+				xr.Read ();
+		}
+
+		[Test]
+		public void Read_ReadOnlyPropertyContainer ()
+		{
+			var obj = new ReadOnlyPropertyContainer () { Foo = "x" };
+			var xr = new XamlObjectReader (obj);
+			var xt = xr.SchemaContext.GetXamlType (obj.GetType ());
+			while (xr.Read ())
+				if (xr.NodeType == XamlNodeType.StartMember)
+					break;
+			Assert.AreEqual (xt.GetMember ("Foo"), xr.Member, "#1");
+			while (!xr.IsEof)
+				xr.Read ();
 		}
 	}
 }

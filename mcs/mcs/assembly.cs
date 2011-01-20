@@ -214,7 +214,7 @@ namespace Mono.CSharp
 				if (value == null || value.Length == 0)
 					return;
 
-				var vinfo = IsValidAssemblyVersion (value.Replace ('*', '0'));
+				var vinfo = IsValidAssemblyVersion (value, true);
 				if (vinfo == null) {
 					a.Error_AttributeEmitError (string.Format ("Specified version `{0}' is not valid", value));
 					return;
@@ -336,7 +336,15 @@ namespace Mono.CSharp
 				}
 			} else if (a.Type == pa.RuntimeCompatibility) {
 				wrap_non_exception_throws_custom = true;
+			} else if (a.Type == pa.AssemblyFileVersion) {
+				string value = a.GetString ();
+				if (string.IsNullOrEmpty (value) || IsValidAssemblyVersion (value, false) == null) {
+					Report.Warning (1607, 1, a.Location, "The version number `{0}' specified for `{1}' is invalid",
+						value, a.Name);
+					return;
+				}
 			}
+
 
 			SetCustomAttribute (ctor, cdata);
 		}
@@ -475,7 +483,7 @@ namespace Mono.CSharp
 			byte[] hash = ha.ComputeHash (public_key);
 			// we need the last 8 bytes in reverse order
 			public_key_token = new byte[8];
-			Array.Copy (hash, (hash.Length - 8), public_key_token, 0, 8);
+			Buffer.BlockCopy (hash, hash.Length - 8, public_key_token, 0, 8);
 			Array.Reverse (public_key_token, 0, 8);
 			return public_key_token;
 		}
@@ -534,11 +542,19 @@ namespace Mono.CSharp
 					byte[] publickey = CryptoConvert.ToCapiPublicKeyBlob (rsa);
 
 					// AssemblyName.SetPublicKey requires an additional header
-					byte[] publicKeyHeader = new byte[12] { 0x00, 0x24, 0x00, 0x00, 0x04, 0x80, 0x00, 0x00, 0x94, 0x00, 0x00, 0x00 };
+					byte[] publicKeyHeader = new byte[8] { 0x00, 0x24, 0x00, 0x00, 0x04, 0x80, 0x00, 0x00 };
 
 					// Encode public key
 					public_key = new byte[12 + publickey.Length];
-					Buffer.BlockCopy (publicKeyHeader, 0, public_key, 0, 12);
+					Buffer.BlockCopy (publicKeyHeader, 0, public_key, 0, publicKeyHeader.Length);
+
+					// Length of Public Key (in bytes)
+					int lastPart = public_key.Length - 12;
+					public_key[8] = (byte) (lastPart & 0xFF);
+					public_key[9] = (byte) ((lastPart >> 8) & 0xFF);
+					public_key[10] = (byte) ((lastPart >> 16) & 0xFF);
+					public_key[11] = (byte) ((lastPart >> 24) & 0xFF);
+
 					Buffer.BlockCopy (publickey, 0, public_key, 12, publickey.Length);
 				} catch {
 					Error_AssemblySigning ("The specified key file `" + keyFile + "' has incorrect format");
@@ -569,19 +585,20 @@ namespace Mono.CSharp
 
 		public void Resolve ()
 		{
-			if (RootContext.Unsafe) {
+			if (RootContext.Unsafe && module.PredefinedTypes.SecurityAction.Define ()) {
 				//
 				// Emits [assembly: SecurityPermissionAttribute (SecurityAction.RequestMinimum, SkipVerification = true)]
 				// when -unsafe option was specified
 				//
-				
 				Location loc = Location.Null;
 
 				MemberAccess system_security_permissions = new MemberAccess (new MemberAccess (
 					new QualifiedAliasMember (QualifiedAliasMember.GlobalAlias, "System", loc), "Security", loc), "Permissions", loc);
 
+				var req_min = (ConstSpec) module.PredefinedTypes.SecurityAction.GetField ("RequestMinimum", module.PredefinedTypes.SecurityAction.TypeSpec, loc);
+
 				Arguments pos = new Arguments (1);
-				pos.Add (new Argument (new MemberAccess (new MemberAccess (system_security_permissions, "SecurityAction", loc), "RequestMinimum")));
+				pos.Add (new Argument (req_min.GetConstant (null)));
 
 				Arguments named = new Arguments (1);
 				named.Add (new NamedArgument ("SkipVerification", loc, new BoolLiteral (true, loc)));
@@ -721,6 +738,7 @@ namespace Mono.CSharp
 				if (RootContext.Target == Target.Module) {
 					Report.Error (1507, "Cannot link resource file when building a module");
 				} else {
+					int counter = 0;
 					foreach (var res in RootContext.Resources) {
 						if (!File.Exists (res.FileName)) {
 							Report.Error (1566, "Error reading resource file `{0}'", res.FileName);
@@ -728,7 +746,16 @@ namespace Mono.CSharp
 						}
 
 						if (res.IsEmbeded) {
-							var stream = File.OpenRead (res.FileName);
+							Stream stream;
+							if (counter++ < 10) {
+								stream = File.OpenRead (res.FileName);
+							} else {
+								// TODO: SRE API requires resource stream to be available during AssemblyBuilder::Save
+								// we workaround it by reading everything into memory to compile projects with
+								// many embedded resource (over 3500) references
+								stream = new MemoryStream (File.ReadAllBytes (res.FileName));
+							}
+
 							module.Builder.DefineManifestResource (res.Name, stream, res.Attributes);
 						} else {
 							Builder.AddResourceFile (res.Name, Path.GetFileName (res.FileName), res.Attributes);
@@ -860,26 +887,43 @@ namespace Mono.CSharp
 			Report.Error (1548, "Error during assembly signing. " + text);
 		}
 
-		static Version IsValidAssemblyVersion (string version)
+		static Version IsValidAssemblyVersion (string version, bool allowGenerated)
 		{
-			Version v;
-			try {
-				v = new Version (version);
-			} catch {
-				try {
-					int major = int.Parse (version, CultureInfo.InvariantCulture);
-					v = new Version (major, 0);
-				} catch {
+			string[] parts = version.Split ('.');
+			if (parts.Length < 1 || parts.Length > 4)
+				return null;
+
+			var values = new int[4];
+			for (int i = 0; i < parts.Length; ++i) {
+				if (!int.TryParse (parts[i], out values[i])) {
+					if (parts[i].Length == 1 && parts[i][0] == '*' && allowGenerated) {
+						if (i == 2) {
+							// Nothing can follow *
+							if (parts.Length > 3)
+								return null;
+
+							// Generate Build value based on days since 1/1/2000
+							TimeSpan days = DateTime.Today - new DateTime (2000, 1, 1);
+							values[i] = System.Math.Max (days.Days, 0);
+							i = 3;
+						}
+
+						if (i == 3) {
+							// Generate Revision value based on every other second today
+							var seconds = DateTime.Now - DateTime.Today;
+							values[i] = (int) seconds.TotalSeconds / 2;
+							continue;
+						}
+					}
+
 					return null;
 				}
-			}
 
-			foreach (int candidate in new int [] { v.Major, v.Minor, v.Build, v.Revision }) {
-				if (candidate > ushort.MaxValue)
+				if (values[i] > ushort.MaxValue)
 					return null;
 			}
 
-			return new Version (v.Major, System.Math.Max (0, v.Minor), System.Math.Max (0, v.Build), System.Math.Max (0, v.Revision));
+			return new Version (values[0], values[1], values[2], values[3]);
 		}
 	}
 

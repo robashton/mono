@@ -966,6 +966,46 @@ namespace MonoTests.System.Xaml
 			obj.Add (new XmlSerializable ("<root/>"));
 			Assert.AreEqual (ReadXml ("List_XmlSerializable.xml").Trim (), XamlServices.Save (obj), "#1");
 		}
+
+		[Test]
+		public void Write_AttachedProperty ()
+		{
+			var obj = new AttachedWrapper ();
+			Attachable.SetFoo (obj, "x");
+			Attachable.SetFoo (obj.Value, "y");
+			try {
+				Assert.AreEqual (ReadXml ("AttachedProperty.xml").Trim (), XamlServices.Save (obj), "#1");
+			} finally {
+				Attachable.SetFoo (obj, null);
+				Attachable.SetFoo (obj.Value, null);
+			}
+		}
+
+		[Test]
+		[Category ("NotWorking")] // cosmetic attribute order difference
+		public void Write_AbstractWrapper ()
+		{
+			var obj = new AbstractContainer () { Value2 = new DerivedObject () { Foo = "x" } };
+			Assert.AreEqual (ReadXml ("AbstractContainer.xml").Trim (), XamlServices.Save (obj), "#1");
+		}
+
+		[Test]
+		public void Write_ReadOnlyPropertyContainer ()
+		{
+			var obj = new ReadOnlyPropertyContainer () { Foo = "x" };
+			Assert.AreEqual (ReadXml ("ReadOnlyPropertyContainer.xml").Trim (), XamlServices.Save (obj), "#1");
+			
+			var sw = new StringWriter ();
+			var xw = new XamlXmlWriter (sw, new XamlSchemaContext ());
+			var xt = xw.SchemaContext.GetXamlType (obj.GetType ());
+			xw.WriteStartObject (xt);
+			xw.WriteStartMember (xt.GetMember ("Bar"));
+			xw.WriteValue ("x");
+			xw.WriteEndMember ();
+			xw.WriteEndObject ();
+			xw.Close ();
+			Assert.IsTrue (sw.ToString ().IndexOf ("Bar") > 0, "#2"); // it is not rejected by XamlXmlWriter. But XamlServices does not write it.
+		}
 	}
 
 	public class TestXmlWriterClass1

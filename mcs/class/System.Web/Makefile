@@ -95,7 +95,7 @@ TEST_RESOURCE_FILES = \
 	Test/mainsoft/NunitWeb/NunitWeb/Resources/MyPage.aspx.cs \
 	Test/mainsoft/NunitWeb/NunitWeb/Resources/MyPageWithMaster.aspx \
 	Test/mainsoft/NunitWeb/NunitWeb/Resources/Web.mono.config \
-	Test/mainsoft/NunitWeb/NunitWeb/Resources/Web.mono.config.1.1 \
+	Test/mainsoft/NunitWeb/NunitWeb/Resources/Web.mono.config.4.0 \
 	Test/mainsoft/NunitWeb/NunitWeb/Resources/sub_map_01.sitemap \
 	Test/mainsoft/NunitWeb/NunitWeb/Resources/test_map_01.sitemap \
 	Test/mainsoft/NunitWeb/NunitWeb/Resources/test_map_02.sitemap \
@@ -234,7 +234,8 @@ TEST_RESOURCE_FILES = \
 	Test/mainsoft/NunitWebResources/GridView_Bug595567.aspx \
 	Test/mainsoft/NunitWebResources/CheckBoxList_Bug600415.aspx \
 	Test/mainsoft/NunitWebResources/BoundField_Bug646505.aspx \
-	Test/mainsoft/NunitWebResources/BoundField_Bug646505.aspx.cs
+	Test/mainsoft/NunitWebResources/BoundField_Bug646505.aspx.cs \
+	Test/mainsoft/NunitWebResources/HtmlTitleCodeRender_Bug662918.aspx
 
 RESX_DIST =  resources/TranslationResources.resx
 ifneq (1, $(FRAMEWORK_VERSION_MAJOR))
@@ -390,6 +391,9 @@ STANDALONE_TEST_RUNNER = Test/tools/standalone-runner.exe
 RUN_STANDALONE = $(TEST_RUNTIME) $(STANDALONE_TEST_RUNNER) --output=StandaloneTestResult-$(PROFILE).log 
 ifdef TESTNAME
 RUN_STANDALONE += --test=$(TESTNAME)
+endif
+ifdef STANDALONE_VERBOSE
+RUN_STANDALONE += --verbose
 endif
 
 $(build_lib): $(RESX_RES) $(RESOURCE_FILES_2) $(RESOURCE_FILES_1)

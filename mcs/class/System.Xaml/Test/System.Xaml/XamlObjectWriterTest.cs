@@ -1206,5 +1206,84 @@ namespace MonoTests.System.Xaml
 				Assert.AreEqual (1, des.Count, "#1");
 			}
 		}
+
+		[Test]
+		public void Write_AttachedProperty ()
+		{
+			using (var xr = GetReader ("AttachedProperty.xml")) {
+				AttachedWrapper des = null;
+				try {
+					des = (AttachedWrapper) XamlServices.Load (xr);
+					Assert.IsNotNull (des.Value, "#1");
+					Assert.AreEqual ("x", Attachable.GetFoo (des), "#2");
+					Assert.AreEqual ("y", Attachable.GetFoo (des.Value), "#3");
+				} finally {
+					if (des != null) {
+						Attachable.SetFoo (des, null);
+						Attachable.SetFoo (des.Value, null);
+					}
+				}
+			}
+		}
+
+		[Test]
+		public void Write_EventStore ()
+		{
+			using (var xr = GetReader ("EventStore.xml")) {
+				var res = (EventStore) XamlServices.Load (xr);
+				Assert.AreEqual ("foo", res.Examine (), "#1");
+				Assert.IsTrue (res.Method1Invoked, "#2");
+			}
+		}
+
+		[Test]
+		[ExpectedException (typeof (XamlDuplicateMemberException))] // for two occurence of Event1 ...
+		public void Write_EventStore2 ()
+		{
+			using (var xr = GetReader ("EventStore2.xml")) {
+				XamlServices.Load (xr);
+			}
+		}
+
+		[Test]
+		[ExpectedException (typeof (XamlObjectWriterException))] // attaching nonexistent method
+		public void Write_EventStore3 ()
+		{
+			using (var xr = GetReader ("EventStore3.xml")) {
+				XamlServices.Load (xr);
+			}
+		}
+
+		[Test]
+		[Category ("NotWorking")] // type resolution failure.
+		public void Write_EventStore4 ()
+		{
+			using (var xr = GetReader ("EventStore4.xml")) {
+				var res = (EventStore2<EventArgs>) XamlServices.Load (xr);
+				Assert.AreEqual ("foo", res.Examine (), "#1");
+				Assert.IsTrue (res.Method1Invoked, "#2");
+			}
+		}
+
+		[Test]
+		public void Write_AbstractWrapper ()
+		{
+			using (var xr = GetReader ("AbstractContainer.xml")) {
+				var res = (AbstractContainer) XamlServices.Load (xr);
+				Assert.IsNull (res.Value1, "#1");
+				Assert.IsNotNull (res.Value2, "#2");
+				Assert.AreEqual ("x", res.Value2.Foo, "#3");
+			}
+		}
+
+		[Test]
+		public void Write_ReadOnlyPropertyContainer ()
+		{
+			using (var xr = GetReader ("ReadOnlyPropertyContainer.xml")) {
+				var res = (ReadOnlyPropertyContainer) XamlServices.Load (xr);
+				Assert.AreEqual ("x", res.Foo, "#1");
+				Assert.AreEqual ("x", res.Bar, "#2");
+			}
+		}
 	}
 }

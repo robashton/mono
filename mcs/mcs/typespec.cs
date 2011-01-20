@@ -433,6 +433,42 @@ namespace Mono.CSharp
 			return this;
 		}
 
+		public override List<TypeSpec> ResolveMissingDependencies ()
+		{
+			List<TypeSpec> missing = null;
+
+			if (Kind == MemberKind.MissingType) {
+				missing = new List<TypeSpec> ();
+				missing.Add (this);
+				return missing;
+			}
+
+			foreach (var targ in TypeArguments) {
+				if (targ.Kind == MemberKind.MissingType) {
+					if (missing == null)
+						missing = new List<TypeSpec> ();
+
+					missing.Add (targ);
+				}
+			}
+
+			if (Interfaces != null) {
+				foreach (var iface in Interfaces) {
+					if (iface.Kind == MemberKind.MissingType) {
+						if (missing == null)
+							missing = new List<TypeSpec> ();
+
+						missing.Add (iface);
+					}
+				}
+			}
+
+			if (missing != null || BaseType == null)
+				return missing;
+
+			return BaseType.ResolveMissingDependencies ();
+		}
+
 		public void SetMetaInfo (MetaType info)
 		{
 			if (this.info != null)
@@ -497,9 +533,6 @@ namespace Mono.CSharp
 		public BuildinTypeSpec (MemberKind kind, string ns, string name, Type buildinKind)
 			: base (kind, null, null, null, Modifiers.PUBLIC)
 		{
-			if (kind == MemberKind.Struct)
-				modifiers |= Modifiers.SEALED;
-
 			this.type = buildinKind;
 			this.ns = ns;
 			this.name = name;
@@ -508,8 +541,8 @@ namespace Mono.CSharp
 		public BuildinTypeSpec (string name, Type buildinKind)
 			: this (MemberKind.InternalCompilerType, "", name, buildinKind)
 		{
-			// Make all internal types CLS-compliant, non-obsolete
-			state = (state & ~(StateFlags.CLSCompliant_Undetected | StateFlags.Obsolete_Undetected)) | StateFlags.CLSCompliant;
+			// Make all internal types CLS-compliant, non-obsolete, compact
+			state = (state & ~(StateFlags.CLSCompliant_Undetected | StateFlags.Obsolete_Undetected | StateFlags.MissingDependency_Undetected)) | StateFlags.CLSCompliant;
 		}
 
 		#region Properties
@@ -573,10 +606,11 @@ namespace Mono.CSharp
 			return FullName;
 		}
 
-		public void SetDefinition (ITypeDefinition td, MetaType type)
+		public void SetDefinition (ITypeDefinition td, MetaType type, Modifiers mod)
 		{
 			this.definition = td;
 			this.info = type;
+			this.modifiers |= (mod & ~Modifiers.AccessibilityMask);
 		}
 
 		public void SetDefinition (TypeSpec ts)
@@ -585,6 +619,7 @@ namespace Mono.CSharp
 			this.info = ts.GetMetaInfo ();
 			this.BaseType = ts.BaseType;
 			this.Interfaces = ts.Interfaces;
+			this.modifiers = ts.Modifiers;
 		}
 	}
 

@@ -3,39 +3,20 @@ SUBDIRS :=
 include ../build/rules.make
 
 EXTRA_DISTFILES = \
-	*mcs.csproj		\
+	mcs.csproj		\
 	compiler.doc		\
-	*mcs.sln		\
-	*cs-parser.jay		\
-	*.sources		\
+	mcs.sln		\
+	cs-parser.jay		\
+	mcs.sources		\
 	NOTES			\
 	TODO			\
-	*mcs.exe.config
+	ikvm.cs
 
-COMPILER_NAME = gmcs
-
-ifeq (net_2_0, $(PROFILE))
-INTERNAL_GMCS = $(RUNTIME) $(RUNTIME_FLAGS) $(topdir)/class/lib/$(BOOTSTRAP_PROFILE)/gmcs.exe
-endif
-
-ifeq (moonlight_bootstrap, $(PROFILE))
-INTERNAL_GMCS = $(RUNTIME) $(RUNTIME_FLAGS) $(topdir)/class/lib/$(BOOTSTRAP_PROFILE)/gmcs.exe
-endif
-
-ifeq (2.1, $(FRAMEWORK_VERSION))
-LOCAL_MCS_FLAGS += -d:SMCS_SOURCE
-COMPILER_NAME = smcs
-endif
-
-ifeq (4.0, $(FRAMEWORK_VERSION))
-COMPILER_NAME = dmcs
-endif
-
-PROGRAM = $(topdir)/class/lib/$(PROFILE)/$(COMPILER_NAME).exe
+LOCAL_MCS_FLAGS += -d:STATIC
+PROGRAM_INSTALL_DIR = $(mono_libdir)/mono/2.0
+PROGRAM = $(topdir)/class/lib/basic/mcs.exe
 
 BUILT_SOURCES = cs-parser.cs
-
-PROGRAM_COMPILE = $(BOOT_COMPILE)
 
 CLEAN_FILES += y.output
 
@@ -58,6 +39,13 @@ csproj-local:
 	echo $(BUILT_SOURCES); \
 	echo $(PROGRAM); \
 	echo $(response)) > $(topdir)/../mono/msvc/scripts/inputs/$$config_file
+	
+ifeq (basic, $(PROFILE))
+install-local:
+	$(MKINSTALLDIRS) $(DESTDIR)$(PROGRAM_INSTALL_DIR)
+	$(INSTALL_BIN) $(PROGRAM) $(DESTDIR)$(PROGRAM_INSTALL_DIR)
+	test ! -f $(PROGRAM).mdb || $(INSTALL_BIN) $(PROGRAM).mdb $(DESTDIR)$(PROGRAM_INSTALL_DIR)
+endif
 
 #
 # Below this line we have local targets used for testing and development

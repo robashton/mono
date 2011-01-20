@@ -89,7 +89,7 @@ namespace System.Net.Sockets {
 			public Socket Sock;
 			public IntPtr handle;
 			object state;
-			AsyncCallback callback;
+			AsyncCallback callback; // used from the runtime
 			WaitHandle waithandle;
 
 			Exception delayedException;
@@ -1129,7 +1129,7 @@ namespace System.Net.Sockets {
 			}
 		}
 
-#if NET_2_1
+#if NET_2_1 || NET_4_0
 		public void Dispose ()
 #else
 		void IDisposable.Dispose ()
@@ -1687,7 +1687,13 @@ namespace System.Net.Sockets {
 		int EndReceive (IAsyncResult result)
 		{
 			SocketError error;
-			return (EndReceive (result, out error));
+			int bytesReceived = EndReceive (result, out error);
+			if (error != SocketError.Success) {
+				if (error != SocketError.WouldBlock && error != SocketError.InProgress)
+					connected = false;
+				throw new SocketException ((int)error);
+			}
+			return bytesReceived;
 		}
 
 #if !MOONLIGHT
@@ -1713,7 +1719,11 @@ namespace System.Net.Sockets {
 				asyncResult.AsyncWaitHandle.WaitOne ();
 
 			errorCode = req.ErrorCode;
-			req.CheckIfThrowDelayedException ();
+			// If no socket error occurred, call CheckIfThrowDelayedException in case there are other
+			// kinds of exceptions that should be thrown.
+			if (errorCode == SocketError.Success)
+				req.CheckIfThrowDelayedException();
+
 			return(req.Total);
 		}
 
@@ -1725,7 +1735,13 @@ namespace System.Net.Sockets {
 		int EndSend (IAsyncResult result)
 		{
 			SocketError error;
-			return(EndSend (result, out error));
+			int bytesSent = EndSend (result, out error);
+			if (error != SocketError.Success) {
+				if (error != SocketError.WouldBlock && error != SocketError.InProgress)
+					connected = false;
+				throw new SocketException ((int)error);
+			}
+			return bytesSent;
 		}
 
 #if !MOONLIGHT
@@ -1750,7 +1766,11 @@ namespace System.Net.Sockets {
 				asyncResult.AsyncWaitHandle.WaitOne ();
 
 			errorCode = req.ErrorCode;
-			req.CheckIfThrowDelayedException ();
+			// If no socket error occurred, call CheckIfThrowDelayedException in case there are other
+			// kinds of exceptions that should be thrown.
+			if (errorCode == SocketError.Success)
+				req.CheckIfThrowDelayedException ();
+
 			return(req.Total);
 		}
 

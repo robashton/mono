@@ -124,6 +124,8 @@ namespace System.Runtime.Serialization
 
 		public QName XmlName { get; set; }
 
+		public abstract bool IsContractAllowedType { get; }
+
 		protected void HandleId (XmlReader reader, XmlFormatterDeserializer deserializer, object instance)
 		{
 			HandleId (reader.GetAttribute ("Id", KnownTypeCollection.MSSimpleNamespace), deserializer, instance);
@@ -381,6 +383,8 @@ namespace System.Runtime.Serialization
 
 	internal partial class XmlSerializableMap : SerializationMap
 	{
+		public override bool IsContractAllowedType { get { return true; } }
+
 		public XmlSerializableMap (Type type, QName qname, KnownTypeCollection knownTypes)
 			: base (type, qname, knownTypes)
 		{
@@ -418,6 +422,8 @@ namespace System.Runtime.Serialization
 			: base (type, qname, knownTypes)
 		{
 		}
+
+		public override bool IsContractAllowedType { get { return true; } }
 
 		internal void Initialize ()
 		{
@@ -483,6 +489,8 @@ namespace System.Runtime.Serialization
 		{
 		}
 
+		public override bool IsContractAllowedType { get { return false; } }
+
 		internal void Initialize ()
 		{
 			Members.AddRange (GetDefaultMembers ());
@@ -529,6 +537,8 @@ namespace System.Runtime.Serialization
 		internal override string CurrentNamespace {
 			get { return XmlName.Namespace; }
 		}
+
+		public override bool IsContractAllowedType { get { return true; } }
 	}
 
 	internal interface ICollectionTypeMap
@@ -573,6 +583,8 @@ namespace System.Runtime.Serialization
 
 			return null;
 		}
+
+		public override bool IsContractAllowedType { get { return false; } }
 
 		public override bool OutputXsiType {
 			get { return false; }
@@ -716,6 +728,8 @@ namespace System.Runtime.Serialization
 		string ContractNamespace {
 			get { return a != null && !String.IsNullOrEmpty (a.Namespace) ? a.Namespace : KnownTypeCollection.MSArraysNamespace; }
 		}
+
+		public override bool IsContractAllowedType { get { return a != null; } }
 
 		public Type KeyType { get { return key_type; } }
 		public Type ValueType { get { return value_type; } }
@@ -872,6 +886,8 @@ namespace System.Runtime.Serialization
 		{
 		}
 
+		public override bool IsContractAllowedType { get { return true; } }
+
 		public void Initialize ()
 		{
 			Members = GetMembers (RuntimeType, XmlName, false);
@@ -944,6 +960,8 @@ namespace System.Runtime.Serialization
 			}
 		}
 
+		public override bool IsContractAllowedType { get { return false; } }
+
 		private EnumMemberAttribute GetEnumMemberAttribute (
 			MemberInfo mi)
 		{
@@ -957,10 +975,23 @@ namespace System.Runtime.Serialization
 		public override void Serialize (object graph,
 			XmlFormatterSerializer serializer)
 		{
-			foreach (EnumMemberInfo emi in enum_members) {
-				if (Enum.Equals (emi.Value, graph)) {
-					serializer.Writer.WriteString (emi.XmlName);
-					return;
+			if (flag_attr) {
+				long val = Convert.ToInt64 (graph);
+				string s = null;
+				foreach (EnumMemberInfo emi in enum_members) {
+					long f = Convert.ToInt64 (emi.Value);
+					if ((f & val) == f)
+						s += (s != null ? " " : String.Empty) + emi.XmlName;
+				}
+				if (s != null)
+					serializer.Writer.WriteString (s);
+				return;
+			} else {
+				foreach (EnumMemberInfo emi in enum_members) {
+					if (Enum.Equals (emi.Value, graph)) {
+						serializer.Writer.WriteString (emi.XmlName);
+						return;
+					}
 				}
 			}
 
@@ -983,9 +1014,23 @@ namespace System.Runtime.Serialization
 			HandleId (id, deserializer, value);
 
 			if (value != String.Empty) {
-				foreach (EnumMemberInfo emi in enum_members)
-					if (emi.XmlName == value)
-						return emi.Value;
+				if (flag_attr && value.IndexOf (' ') != -1) {
+					long flags = 0l;
+					foreach (string flag in value.Split (' ')) {
+						foreach (EnumMemberInfo emi in enum_members) {
+							if (emi.XmlName == flag) {
+								flags |= Convert.ToInt64 (emi.Value);
+								break;
+							}
+						}
+					}
+					return Enum.ToObject (RuntimeType, flags);
+				}
+				else {
+					foreach (EnumMemberInfo emi in enum_members)
+						if (emi.XmlName == value)
+							return emi.Value;
+				}
 			}
 
 			if (!flag_attr)

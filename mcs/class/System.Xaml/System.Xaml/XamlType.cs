@@ -376,13 +376,70 @@ namespace System.Xaml
 		protected virtual IEnumerable<XamlMember> LookupAllAttachableMembers ()
 		{
 			if (UnderlyingType == null)
-				return BaseType != null ? BaseType.GetAllAttachableMembers () : null;
-			return DoLookupAllAttachableMembers ();
+				return BaseType != null ? BaseType.GetAllAttachableMembers () : empty_array;
+			if (all_attachable_members_cache == null) {
+				all_attachable_members_cache = new List<XamlMember> (DoLookupAllAttachableMembers ());
+				all_attachable_members_cache.Sort (TypeExtensionMethods.CompareMembers);
+			}
+			return all_attachable_members_cache;
 		}
 
 		IEnumerable<XamlMember> DoLookupAllAttachableMembers ()
 		{
-			yield break; // FIXME: what to return here?
+			// based on http://msdn.microsoft.com/en-us/library/ff184560.aspx
+			var bf = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
+
+			var gl = new Dictionary<string,MethodInfo> ();
+			var sl = new Dictionary<string,MethodInfo> ();
+			var al = new Dictionary<string,MethodInfo> ();
+			//var rl = new Dictionary<string,MethodInfo> ();
+			var nl = new List<string> ();
+			foreach (var mi in UnderlyingType.GetMethods (bf)) {
+				string name = null;
+				if (mi.Name.StartsWith ("Get", StringComparison.Ordinal)) {
+					if (mi.ReturnType == typeof (void))
+						continue;
+					var args = mi.GetParameters ();
+					if (args.Length != 1)
+						continue;
+					name = mi.Name.Substring (3);
+					gl.Add (name, mi);
+				} else if (mi.Name.StartsWith ("Set", StringComparison.Ordinal)) {
+					// looks like the return type is *ignored*
+					//if (mi.ReturnType != typeof (void))
+					//	continue;
+					var args = mi.GetParameters ();
+					if (args.Length != 2)
+						continue;
+					name = mi.Name.Substring (3);
+					sl.Add (name, mi);
+				} else if (mi.Name.EndsWith ("Handler", StringComparison.Ordinal)) {
+					var args = mi.GetParameters ();
+					if (args.Length != 2)
+						continue;
+					if (mi.Name.StartsWith ("Add", StringComparison.Ordinal)) {
+						name = mi.Name.Substring (3, mi.Name.Length - 3 - 7);
+						al.Add (name, mi);
+					}/* else if (mi.Name.StartsWith ("Remove", StringComparison.Ordinal)) {
+						name = mi.Name.Substring (6, mi.Name.Length - 6 - 7);
+						rl.Add (name, mi);
+					}*/
+				}
+				if (name != null && !nl.Contains (name))
+					nl.Add (name);
+			}
+
+			foreach (var name in nl) {
+				MethodInfo m;
+				var g = gl.TryGetValue (name, out m) ? m : null;
+				var s = sl.TryGetValue (name, out m) ? m : null;
+				if (g != null || s != null)
+					yield return new XamlMember (name, g, s, SchemaContext);
+				var a = al.TryGetValue (name, out m) ? m : null;
+				//var r = rl.TryGetValue (name, out m) ? m : null;
+				if (a != null)
+					yield return new XamlMember (name, a, SchemaContext);
+			}
 		}
 
 		static readonly XamlMember [] empty_array = new XamlMember [0];
@@ -399,6 +456,7 @@ namespace System.Xaml
 		}
 		
 		List<XamlMember> all_members_cache;
+		List<XamlMember> all_attachable_members_cache;
 
 		IEnumerable<XamlMember> DoLookupAllMembers ()
 		{
@@ -447,24 +505,22 @@ namespace System.Xaml
 
 		protected virtual XamlMember LookupAttachableMember (string name)
 		{
-			throw new NotImplementedException ();
+			return GetAllAttachableMembers ().FirstOrDefault (m => m.Name == name);
 		}
 
-		[MonoTODO]
 		protected virtual XamlType LookupBaseType ()
 		{
 			if (base_type == null) {
 				if (UnderlyingType == null)
-					// FIXME: probably something advanced is needed here.
-					base_type = new XamlType (typeof (object), SchemaContext, Invoker);
+					base_type = SchemaContext.GetXamlType (typeof (object));
 				else
-					base_type = type.BaseType == null || type.BaseType == typeof (object) ? null : new XamlType (type.BaseType, SchemaContext, Invoker);
+					base_type = type.BaseType == null || type.BaseType == typeof (object) ? null : SchemaContext.GetXamlType (type.BaseType);
 			}
 			return base_type;
 		}
 
 		// This implementation is not verified. (No place to use.)
-		protected virtual XamlCollectionKind LookupCollectionKind ()
+		protected internal virtual XamlCollectionKind LookupCollectionKind ()
 		{
 			if (UnderlyingType == null)
 				return BaseType != null ? BaseType.LookupCollectionKind () : XamlCollectionKind.None;
@@ -711,8 +767,12 @@ namespace System.Xaml
 				return SchemaContext.GetValueConverter<TypeConverter> (null, this);
 
 			// It's still not decent to check CollectionConverter.
-			var tct = TypeDescriptor.GetConverter (t).GetType ();
+			var tct = t.GetTypeConverter ().GetType ();
+#if MOONLIGHT
+			if (tct != typeof (TypeConverter) && tct.Name != "CollectionConverter" && tct.Name != "ReferenceConverter")
+#else
 			if (tct != typeof (TypeConverter) && tct != typeof (CollectionConverter) && tct != typeof (ReferenceConverter))
+#endif
 				return SchemaContext.GetValueConverter<TypeConverter> (tct, this);
 			return null;
 		}
@@ -762,7 +822,7 @@ namespace System.Xaml
 		static string GetXamlName (Type type)
 		{
 			string n;
-			if (!type.IsNested)
+			if (!type.IsNestedPublic && !type.IsNestedAssembly && !type.IsNestedPrivate)
 				n = type.Name;
 			else
 				n = GetXamlName (type.DeclaringType) + "+" + type.Name;

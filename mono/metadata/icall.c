@@ -687,7 +687,6 @@ ves_icall_System_Array_FastCopy (MonoArray *source, int source_idx, MonoArray* d
 	void * source_addr;
 	MonoClass *src_class;
 	MonoClass *dest_class;
-	int i;
 
 	MONO_ARCH_SAVE_REGS;
 
@@ -711,6 +710,10 @@ ves_icall_System_Array_FastCopy (MonoArray *source, int source_idx, MonoArray* d
 
 	/* Case1: object[] -> valuetype[] (ArrayList::ToArray) */
 	if (src_class == mono_defaults.object_class && dest_class->valuetype) {
+		// FIXME: This is racy
+		return FALSE;
+		/*
+		  int i;
 		int has_refs = dest_class->has_references;
 		for (i = source_idx; i < source_idx + length; ++i) {
 			MonoObject *elem = mono_array_get (source, MonoObject*, i);
@@ -731,6 +734,7 @@ ves_icall_System_Array_FastCopy (MonoArray *source, int source_idx, MonoArray* d
 				memcpy (addr, (char *)elem + sizeof (MonoObject), element_size);
 		}
 		return TRUE;
+		*/
 	}
 
 	/* Check if we're copying a char[] <==> (u)short[] */
@@ -741,13 +745,18 @@ ves_icall_System_Array_FastCopy (MonoArray *source, int source_idx, MonoArray* d
 		if (mono_class_is_subclass_of (src_class, dest_class, FALSE))
 			;
 		/* Case2: object[] -> reftype[] (ArrayList::ToArray) */
-		else if (mono_class_is_subclass_of (dest_class, src_class, FALSE))
+		else if (mono_class_is_subclass_of (dest_class, src_class, FALSE)) {
+			// FIXME: This is racy
+			return FALSE;
+			/*
+			  int i;
 			for (i = source_idx; i < source_idx + length; ++i) {
 				MonoObject *elem = mono_array_get (source, MonoObject*, i);
 				if (elem && !mono_object_isinst (elem, dest_class))
 					return FALSE;
 			}
-		else
+			*/
+		} else
 			return FALSE;
 	}
 
@@ -825,12 +834,9 @@ ves_icall_System_Runtime_CompilerServices_RuntimeHelpers_InitializeArray (MonoAr
 	int align;
 	const char *field_data;
 
-	if (MONO_TYPE_IS_REFERENCE (type) ||
-			(type->type == MONO_TYPE_VALUETYPE &&
-				(!mono_type_get_class (type) ||
-				mono_type_get_class (type)->has_references))) {
+	if (MONO_TYPE_IS_REFERENCE (type) || type->type == MONO_TYPE_VALUETYPE) {
 		MonoException *exc = mono_get_exception_argument("array",
-			"Cannot initialize array containing references");
+			"Cannot initialize array of non-primitive type.");
 		mono_raise_exception (exc);
 	}
 
@@ -6301,12 +6307,13 @@ ves_icall_System_Environment_get_Platform (void)
 #elif defined(__MACH__)
 	/* OSX */
 	//
-	// For compatibility with our client code, this will be 4 for a while.
-	// We will eventually move to 6 to match .NET, but it requires all client
-	// code to be updated and the documentation everywhere to be updated 
-	// first.
+	// Notice that the value is hidden from user code, and only exposed
+	// to mscorlib.   This is due to Mono's Unix/MacOS code predating the
+	// define and making assumptions based on Unix/128/4 values before there
+	// was a MacOS define.    Lots of code would assume that not-Unix meant
+	// Windows, but in this case, it would be OSX. 
 	//
-	return 4;
+	return 6;
 #else
 	/* Unix */
 	return 4;

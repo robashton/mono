@@ -30,6 +30,8 @@ RESOURCE_FILES_DIST= \
 
 NUNIT_RESOURCE_FILES= \
 	Test/resources/Web.mono.config \
+	Test/resources/profile.config.4.0 \
+	Test/resources/profile.config.2.0 \
 	$(wildcard Test/resources/*.as?x) \
 	$(wildcard ../System.Web/Test/mainsoft/NunitWeb/NunitWeb/Resources/*.cs) \
 	$(wildcard ../System.Web/Test/mainsoft/NunitWeb/NunitWeb/Resources/*.as?x) \
@@ -71,7 +73,7 @@ LIB_MCS_FLAGS = \
 	$(OTHER_LIB_MCS_FLAGS) 		\
 	$(RESOURCE_FILES:%=/resource:%)
 
-TEST_MCS_FLAGS = $(LIB_MCS_FLAGS) -doc:$(test_lib:.dll=.xml) -nowarn:219,169,1591 $(NUNIT_RESOURCE_FILES:%=/resource:%) -r:SystemWebTestShim.dll
+TEST_MCS_FLAGS = $(LIB_MCS_FLAGS) -doc:$(test_lib:.dll=.xml) -nowarn:219,169,1591 $(NUNIT_RESOURCE_FILES:%=/resource:%) -r:SystemWebTestShim.dll -define:SYSTEM_WEB_EXTENSIONS
 
 EXTRA_DISTFILES = $(RESOURCE_FILES_DIST) $(NUNIT_RESOURCE_FILES) \
 	System.Web.Extensions_standalone_test.dll.sources

@@ -298,9 +298,10 @@ namespace Mono.CSharp {
 				}
 			}
 
-			parameters.ApplyAttributes (this, InvokeBuilder.MethodBuilder);
-			
+			Constructor.ParameterInfo.ApplyAttributes (this, Constructor.ConstructorBuilder);
 			Constructor.ConstructorBuilder.SetImplementationFlags (MethodImplAttributes.Runtime);
+
+			parameters.ApplyAttributes (this, InvokeBuilder.MethodBuilder);
 			InvokeBuilder.MethodBuilder.SetImplementationFlags (MethodImplAttributes.Runtime);
 
 			if (BeginInvokeBuilder != null) {
@@ -451,7 +452,12 @@ namespace Mono.CSharp {
 
 			Arguments args = new Arguments (3);
 			args.Add (new Argument (new TypeOf (new TypeExpression (type, loc), loc)));
-			args.Add (new Argument (new NullLiteral (loc)));
+
+			if (method_group.InstanceExpression == null)
+				args.Add (new Argument (new NullLiteral (loc)));
+			else
+				args.Add (new Argument (method_group.InstanceExpression));
+
 			args.Add (new Argument (method_group.CreateExpressionTree (ec)));
 			Expression e = new Invocation (ma, args).Resolve (ec);
 			if (e == null)

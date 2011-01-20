@@ -162,6 +162,7 @@ namespace Mono.CSharp
 			buildin_types.Add (typeof (System.RuntimeTypeHandle), buildin.RuntimeTypeHandle);
 		}
 	}
+
 #endif
 
 	public class AssemblyDefinitionDynamic : AssemblyDefinition
@@ -443,7 +444,6 @@ namespace Mono.CSharp
 		Assembly LoadAssemblyFile (string assembly, bool soft)
 		{
 			Assembly a = null;
-			string total_log = "";
 
 			try {
 				try {
@@ -468,12 +468,10 @@ namespace Mono.CSharp
 							a = Assembly.LoadFrom (full_path);
 							err = false;
 							break;
-						} catch (FileNotFoundException ff) {
-							if (soft)
-								return a;
-							total_log += ff.FusionLog;
+						} catch (FileNotFoundException) {
 						}
 					}
+
 					if (err) {
 						Error_FileNotFound (assembly);
 						return a;

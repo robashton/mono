@@ -74,6 +74,8 @@ mono_helper_stelem_ref_check (MonoArray *array, MonoObject *val)
 {
 	MONO_ARCH_SAVE_REGS;
 
+	if (!array)
+		mono_raise_exception (mono_get_exception_null_reference ());
 	if (val && !mono_object_isinst (val, array->obj.vtable->klass->element_class))
 		mono_raise_exception (mono_get_exception_array_type_mismatch ());
 }
@@ -923,6 +925,16 @@ double
 mono_lconv_to_r8_un (guint64 a)
 {
 	return (double)a;
+}
+#endif
+
+#if defined(__native_client_codegen__) || defined(__native_client__)
+/* When we cross-compile to Native Client we can't directly embed calls */
+/* to the math library on the host. This will use the fmod on the target*/
+double
+mono_fmod(double a, double b)
+{
+	return fmod(a, b);
 }
 #endif
 

@@ -26,6 +26,9 @@
 
 /* pthread impl */
 #include "config.h"
+
+#ifdef HAVE_SGEN_GC
+
 #include <glib.h>
 #include <pthread.h>
 #include <signal.h>
@@ -179,7 +182,7 @@ struct _GCMemSection {
 
 typedef struct _SgenPinnedChunk SgenPinnedChunk;
 
-#if defined(__APPLE__) || defined(__OpenBSD__)
+#if defined(__APPLE__) || defined(__OpenBSD__) || defined(__FreeBSD__)
 const static int suspend_signal_num = SIGXFSZ;
 #else
 const static int suspend_signal_num = SIGPWR;
@@ -347,6 +350,7 @@ enum {
 };
 
 #define SGEN_VTABLE_HAS_REFERENCES(vt)	(((MonoVTable*)(vt))->gc_descr != (void*)DESC_TYPE_RUN_LENGTH)
+#define SGEN_CLASS_HAS_REFERENCES(c)	((c)->gc_descr != (void*)DESC_TYPE_RUN_LENGTH)
 
 /* helper macros to scan and traverse objects, macros because we resue them in many functions */
 #define OBJ_RUN_LEN_SIZE(size,desc,obj) do { \
@@ -797,5 +801,8 @@ gboolean mono_sgen_ptr_is_in_los (char *ptr, char **start) MONO_INTERNAL;
 void mono_sgen_los_iterate_objects (IterateObjectCallbackFunc cb, void *user_data) MONO_INTERNAL;
 void mono_sgen_los_iterate_live_block_ranges (sgen_cardtable_block_callback callback) MONO_INTERNAL;
 void mono_sgen_los_scan_card_table (SgenGrayQueue *queue) MONO_INTERNAL;
+FILE *mono_sgen_get_logfile (void) MONO_INTERNAL;
+
+#endif /* HAVE_SGEN_GC */
 
 #endif /* __MONO_SGENGC_H__ */

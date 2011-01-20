@@ -86,6 +86,9 @@ delegate_hash_table_add (MonoDelegate *d);
 static void
 emit_struct_conv (MonoMethodBuilder *mb, MonoClass *klass, gboolean to_object);
 
+static void
+emit_struct_conv_full (MonoMethodBuilder *mb, MonoClass *klass, gboolean to_object, MonoMarshalNative string_encoding);
+
 static void 
 mono_struct_delete_old (MonoClass *klass, char *ptr);
 
@@ -103,6 +106,9 @@ mono_string_utf8_to_builder2 (char *text);
 
 static MonoStringBuilder *
 mono_string_utf16_to_builder2 (gunichar2 *text);
+
+static MonoString*
+mono_string_new_len_wrapper (const char *text, guint length);
 
 static void
 mono_byvalarray_to_array (MonoArray *arr, gpointer native_arr, MonoClass *eltype, guint32 elnum);
@@ -204,6 +210,7 @@ mono_marshal_init (void)
 		register_icall (mono_string_to_utf16, "mono_string_to_utf16", "ptr obj", FALSE);
 		register_icall (mono_string_from_utf16, "mono_string_from_utf16", "obj ptr", FALSE);
 		register_icall (mono_string_new_wrapper, "mono_string_new_wrapper", "obj ptr", FALSE);
+		register_icall (mono_string_new_len_wrapper, "mono_string_new_len_wrapper", "obj ptr int", FALSE);
 		register_icall (mono_string_to_utf8, "mono_string_to_utf8", "ptr obj", FALSE);
 		register_icall (mono_string_to_lpstr, "mono_string_to_lpstr", "ptr obj", FALSE);
 		register_icall (mono_string_to_ansibstr, "mono_string_to_ansibstr", "ptr object", FALSE);
@@ -966,6 +973,12 @@ mono_string_to_byvalwstr (gpointer dst, MonoString *src, int size)
 	if (size <= mono_string_length (src))
 		len--;
 	*((gunichar2 *) dst + len) = 0;
+}
+
+static MonoString*
+mono_string_new_len_wrapper (const char *text, guint length)
+{
+	return mono_string_new_len (mono_domain_get (), text, length);
 }
 
 static int
@@ -1756,7 +1769,8 @@ emit_object_to_ptr_conv (MonoMethodBuilder *mb, MonoType *type, MonoMarshalConv 
 }
 
 static void
-emit_struct_conv_full (MonoMethodBuilder *mb, MonoClass *klass, gboolean to_object, gboolean unicode)
+emit_struct_conv_full (MonoMethodBuilder *mb, MonoClass *klass, gboolean to_object,
+					   MonoMarshalNative string_encoding)
 {
 	MonoMarshalType *info;
 	int i;
@@ -1859,7 +1873,7 @@ emit_struct_conv_full (MonoMethodBuilder *mb, MonoClass *klass, gboolean to_obje
 			case MONO_TYPE_R8:
 				mono_mb_emit_ldloc (mb, 1);
 				mono_mb_emit_ldloc (mb, 0);
-				if (ftype->type == MONO_TYPE_CHAR && !unicode) {
+				if (t == MONO_TYPE_CHAR && ntype == MONO_NATIVE_U1 && string_encoding != MONO_NATIVE_LPWSTR) {
 					if (to_object) {
 						mono_mb_emit_byte (mb, CEE_LDIND_U1);
 						mono_mb_emit_byte (mb, CEE_STIND_I2);
@@ -1978,7 +1992,7 @@ emit_struct_conv_full (MonoMethodBuilder *mb, MonoClass *klass, gboolean to_obje
 static void
 emit_struct_conv (MonoMethodBuilder *mb, MonoClass *klass, gboolean to_object)
 {
-	emit_struct_conv_full (mb, klass, to_object, TRUE);
+	emit_struct_conv_full (mb, klass, to_object, -1);
 }
 
 static void
@@ -2203,6 +2217,7 @@ mono_marshal_get_string_to_ptr_conv (MonoMethodPInvoke *piinfo, MonoMarshalSpec 
 	case MONO_NATIVE_LPWSTR:
 		return MONO_MARSHAL_CONV_STR_LPWSTR;
 	case MONO_NATIVE_LPSTR:
+	case MONO_NATIVE_VBBYREFSTR:
 		return MONO_MARSHAL_CONV_STR_LPSTR;
 	case MONO_NATIVE_LPTSTR:
 		return MONO_MARSHAL_CONV_STR_LPTSTR;
@@ -2245,6 +2260,7 @@ mono_marshal_get_ptr_to_string_conv (MonoMethodPInvoke *piinfo, MonoMarshalSpec 
 		*need_free = FALSE;
 		return MONO_MARSHAL_CONV_LPWSTR_STR;
 	case MONO_NATIVE_LPSTR:
+	case MONO_NATIVE_VBBYREFSTR:
 		return MONO_MARSHAL_CONV_LPSTR_STR;
 	case MONO_NATIVE_LPTSTR:
 		return MONO_MARSHAL_CONV_LPTSTR_STR;
@@ -4040,7 +4056,7 @@ signature_dup_add_this (MonoMethodSignature *sig, MonoClass *klass)
 	res->hasthis = FALSE;
 	for (i = sig->param_count - 1; i >= 0; i --)
 		res->params [i + 1] = sig->params [i];
-	res->params [0] = &mono_ptr_class_get (&klass->byval_arg)->byval_arg;
+	res->params [0] = klass->valuetype ? &klass->this_arg : &klass->byval_arg;
 
 	return res;
 }
@@ -4588,6 +4604,10 @@ mono_marshal_get_runtime_invoke (MonoMethod *method, gboolean virtual)
 	csig->params [2] = &mono_defaults.int_class->byval_arg;
 	csig->params [3] = &mono_defaults.int_class->byval_arg;
 	csig->pinvoke = 1;
+#if TARGET_WIN32
+	/* This is called from runtime code so it has to be cdecl */
+	csig->call_convention = MONO_CALL_C;
+#endif
 
 	name = mono_signature_to_name (callsig, virtual ? "runtime_invoke_virtual" : "runtime_invoke");
 	mb = mono_mb_new (target_klass, name,  MONO_WRAPPER_RUNTIME_INVOKE);
@@ -5370,7 +5390,10 @@ emit_marshal_custom (EmitMarshalContext *m, int argnum, MonoType *t,
 
 	if (!ICustomMarshaler) {
 		ICustomMarshaler = mono_class_from_name (mono_defaults.corlib, "System.Runtime.InteropServices", "ICustomMarshaler");
-		g_assert (ICustomMarshaler);
+		if (!ICustomMarshaler) {
+			exception_msg = g_strdup ("Current profile doesn't support ICustomMarshaler");
+			goto handle_exception;
+		}
 
 		cleanup_native = mono_class_get_method_from_name (ICustomMarshaler, "CleanUpNativeData", 1);
 		g_assert (cleanup_native);
@@ -5402,6 +5425,7 @@ emit_marshal_custom (EmitMarshalContext *m, int argnum, MonoType *t,
 	if (!get_instance)
 		exception_msg = g_strdup_printf ("Custom marshaler '%s' does not implement a static GetInstance method that takes a single string parameter and returns an ICustomMarshaler.", mklass->name);
 
+handle_exception:
 	/* Throw exception and emit compensation code if neccesary */
 	if (exception_msg) {
 		switch (action) {
@@ -6026,7 +6050,27 @@ emit_marshal_string (EmitMarshalContext *m, int argnum, MonoType *t,
 			break;
 		}
 
-		if (t->byref && (t->attrs & PARAM_ATTRIBUTE_OUT)) {
+		if (encoding == MONO_NATIVE_VBBYREFSTR) {
+			static MonoMethod *m;
+
+			if (!m) {
+				m = mono_class_get_method_from_name_flags (mono_defaults.string_class, "get_Length", -1, 0);
+				g_assert (m);
+			}
+
+			/* 
+			 * Have to allocate a new string with the same length as the original, and
+			 * copy the contents of the buffer pointed to by CONV_ARG into it.
+			 */
+			g_assert (t->byref);
+			mono_mb_emit_ldarg (mb, argnum);
+			mono_mb_emit_ldloc (mb, conv_arg);
+			mono_mb_emit_ldarg (mb, argnum);
+			mono_mb_emit_byte (mb, CEE_LDIND_I);				
+			mono_mb_emit_managed_call (mb, m, NULL);
+			mono_mb_emit_icall (mb, mono_string_new_len_wrapper);
+			mono_mb_emit_byte (mb, CEE_STIND_REF);
+		} else if (t->byref && (t->attrs & PARAM_ATTRIBUTE_OUT)) {
 			mono_mb_emit_ldarg (mb, argnum);
 			mono_mb_emit_ldloc (mb, conv_arg);
 			mono_mb_emit_icall (mb, conv_to_icall (conv));
@@ -6043,7 +6087,7 @@ emit_marshal_string (EmitMarshalContext *m, int argnum, MonoType *t,
 		break;
 
 	case MARSHAL_ACTION_PUSH:
-		if (t->byref)
+		if (t->byref && encoding != MONO_NATIVE_VBBYREFSTR)
 			mono_mb_emit_ldloc_addr (mb, conv_arg);
 		else
 			mono_mb_emit_ldloc (mb, conv_arg);
@@ -6940,13 +6984,12 @@ mono_pinvoke_is_unicode (MonoMethodPInvoke *piinfo)
 	case PINVOKE_ATTRIBUTE_CHAR_SET_UNICODE:
 		return TRUE;
 	case PINVOKE_ATTRIBUTE_CHAR_SET_AUTO:
+	default:
 #ifdef TARGET_WIN32
 		return TRUE;
 #else
 		return FALSE;
 #endif
-	default:
-		return FALSE;
 	}
 }
 
@@ -7074,7 +7117,7 @@ emit_marshal_array (EmitMarshalContext *m, int argnum, MonoType *t,
 				mono_mb_emit_stloc (mb, 1);
 
 				/* emit valuetype conversion code */
-				emit_struct_conv_full (mb, eklass, FALSE, mono_pinvoke_is_unicode (m->piinfo));
+				emit_struct_conv_full (mb, eklass, FALSE, eklass == mono_defaults.char_class ? encoding : -1);
 			}
 
 			mono_mb_emit_add_to_local (mb, index_var, 1);
@@ -7192,7 +7235,7 @@ emit_marshal_array (EmitMarshalContext *m, int argnum, MonoType *t,
 					mono_mb_emit_stloc (mb, 1);
 
 					/* emit valuetype conversion code */
-					emit_struct_conv_full (mb, eklass, TRUE, mono_pinvoke_is_unicode (m->piinfo));
+					emit_struct_conv_full (mb, eklass, TRUE, eklass == mono_defaults.char_class ? encoding : -1);
 				}
 
 				if (need_free) {
